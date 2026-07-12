@@ -842,6 +842,7 @@ const THINKING_LEVELS = [
 	{ value: "high", labelKey: "thinking.levelLabel.high", descriptionKey: "thinking.level.high" },
 	// xhigh 只在部分模型上可用;选择后以前端收到的 runtime state 为准,必要时提示用户已被回退。
 	{ value: "xhigh", labelKey: "thinking.levelLabel.xhigh", descriptionKey: "thinking.level.xhigh" },
+	{ value: "max", labelKey: "thinking.levelLabel.max", descriptionKey: "thinking.level.xhigh" },
 ] satisfies Array<{ value: string; labelKey: TranslationKey; descriptionKey: TranslationKey }>;
 
 export function ComposerModePicker(props: {
@@ -2913,7 +2914,7 @@ function MarkdownLink(
 	const handleClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
 		e.preventDefault();
 		if (!props.href) return;
-		
+
 		// 处理文件路径链接（file:// 协议）
 		if (props.href.startsWith('file://')) {
 			const filePath = decodeURIComponent(props.href.slice(7));
