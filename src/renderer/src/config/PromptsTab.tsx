@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Editor } from "@monaco-editor/react";
-import { FileEdit, Pencil, Trash2 } from "lucide-react";
+import { Check, FileEdit, Pencil, ShoppingBag, Trash2, X } from "lucide-react";
 import type {
 	CreatePiPromptTemplateInput,
 	PiPromptTemplateListResult,
@@ -8,32 +7,8 @@ import type {
 } from "../../../shared/types";
 import { t } from "../i18n";
 import { CloseIconButton } from "../components/ui/IconButton";
-import { setupMonaco } from "../utils/monacoSetup";
-
-/** 只初始化一次 Monaco loader */
-let monacoSetupOnce = false;
-function ensureMonaco() {
-	if (monacoSetupOnce) return;
-	monacoSetupOnce = true;
-	setupMonaco();
-}
-
-const DEFAULT_EDITOR_OPTIONS = {
-	minimap: { enabled: false },
-	lineNumbers: "on" as const,
-	folding: true,
-	fontSize: 13,
-	padding: { top: 10, bottom: 10 },
-	scrollBeyondLastLine: false,
-	wordWrap: "on" as const,
-	tabSize: 2,
-	insertSpaces: true,
-};
-
-/** 根据 html[data-theme] 返回 Monaco 主题 */
-function editorTheme(): "vs-dark" | "vs" {
-	return document.documentElement.getAttribute("data-theme") === "dark" ? "vs-dark" : "vs";
-}
+import { MonacoEditor } from "../components/ui/MonacoEditor";
+import { PromptStoreTab } from "./PromptStoreTab";
 
 export function PromptsTab(props: {
 	data: PiPromptTemplateListResult;
@@ -63,8 +38,10 @@ export function PromptsTab(props: {
 	onSaveEdit: () => void;
 }) {
 	const { data } = props;
-	ensureMonaco();
 	const canCreate = props.newName.trim().length > 0 && props.newDescription.trim().length > 0;
+
+	// tab 切换："local"（本地模板） 或 "store"（在线商店）
+	const [promptTab, setPromptTab] = useState<"local" | "store">("local");
 
 	// Prompt 重命名状态
 	const [renamingTemplate, setRenamingTemplate] = useState<string | null>(null);
@@ -115,7 +92,30 @@ export function PromptsTab(props: {
 
 	return (
 		<div className="prompts-tab">
-			<div className="config-toolbar">
+			{/* tab 切换栏 */}
+			<div className="prompts-tab-bar">
+				<button
+					className={`prompts-tab-btn ${promptTab === "local" ? "active" : ""}`}
+					onClick={() => setPromptTab("local")}
+				>
+					{t("config.nav.prompts")}
+				</button>
+				<button
+					className={`prompts-tab-btn ${promptTab === "store" ? "active" : ""}`}
+					onClick={() => setPromptTab("store")}
+				>
+					<ShoppingBag size={14} strokeWidth={1.8} />
+					{t("config.promptStoreTab")}
+				</button>
+			</div>
+
+			{promptTab === "store" ? (
+				<PromptStoreTab
+					onImported={props.onRefresh}
+				/>
+			) : (
+				<>
+					<div className="config-toolbar">
 				<div>
 					<span className="config-count">
 						{t("config.count.prompts", { count: data.templates.length })}
@@ -196,10 +196,10 @@ export function PromptsTab(props: {
 											disabled={renameBusy}
 										/>
 										<button className="config-icon-btn" onClick={handleRename} disabled={renameBusy} title={t("common.confirm")}>
-											✓
+											<Check size={14} strokeWidth={2} />
 										</button>
 										<button className="config-icon-btn" onClick={() => setRenamingTemplate(null)} disabled={renameBusy} title={t("common.cancel")}>
-											✕
+											<X size={14} strokeWidth={2} />
 										</button>
 									</div>
 								) : (
@@ -242,8 +242,8 @@ export function PromptsTab(props: {
 				)}
 			</section>
 
-			{/* 编辑弹框 */}
-			{props.editingTemplate && (
+				{/* 编辑弹框 */}
+				{props.editingTemplate && (
 				<div
 					className="prompts-editor-backdrop"
 					onClick={props.onCancelEdit}
@@ -269,21 +269,16 @@ export function PromptsTab(props: {
 							<div className="config-empty">{t("common.loading")}</div>
 						) : (
 							<div className="prompts-monaco-wrap">
-								<Editor
-									height="100%"
-									defaultLanguage="markdown"
+								<MonacoEditor
 									value={props.editContent}
-									theme={editorTheme()}
-									onChange={(val) => props.onChangeEditContent(val ?? "")}
-									options={{
-										...DEFAULT_EDITOR_OPTIONS,
-										readOnly: false,
-									}}
+									onChange={props.onChangeEditContent}
 								/>
 							</div>
 						)}
 					</div>
 				</div>
+			)}
+				</>
 			)}
 		</div>
 	);

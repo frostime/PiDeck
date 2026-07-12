@@ -29,7 +29,102 @@ export type PromptTemplateInfo = {
 	path: string;
 	description: string;
 	content: string;
+	argumentHint?: string;
 };
+
+/** 从 frontmatter 中提取 argument-hint 元数据 */
+export function parseArgumentHint(content: string): string | undefined {
+	const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+	if (!match) return undefined;
+	for (const line of match[1].split(/\r?\n/)) {
+		const idx = line.indexOf(":");
+		if (idx === -1) continue;
+		const key = line.slice(0, idx).trim();
+		if (key === "argument-hint") {
+			return line.slice(idx + 1).trim().replace(/^['"]|['"]$/g, "");
+		}
+	}
+	// 兜底：从内容正文中扫描 ${name} / ${name:default} 模式，按首次出现顺序推断提示
+	return scanArgumentHintFromBody(content);
+}
+
+/** 从内容正文中扫描 ${var} / ${var:default} 模式生成 argument-hint 兜底 */
+function scanArgumentHintFromBody(content: string): string | undefined {
+	// 去掉 frontmatter 部分
+	const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
+	const seen = new Map<string, { hasDefault: boolean; defaultVal?: string }>();
+	const regex = /\$\{([a-zA-Z_]\w*)(?::(.*?))?\}/g;
+	let m: RegExpExecArray | null;
+	while ((m = regex.exec(body)) !== null) {
+		const name = m[1];
+		if (!seen.has(name)) {
+			seen.set(name, {
+				hasDefault: m[2] !== undefined,
+				defaultVal: m[2],
+			});
+		}
+	}
+	if (seen.size === 0) return undefined;
+	const hints: string[] = [];
+	// 按首次出现顺序输出
+	for (const [name, info] of seen) {
+		if (info.hasDefault) {
+			hints.push(`[${name}:${info.defaultVal}]`);
+		} else {
+			hints.push(`<${name}>`);
+		}
+	}
+	return hints.join(" ");
+}
+
+/** 内置 prompt 模板的中文 description 映射 */
+const BUILTIN_PROMPT_DESC_CN: Record<string, string> = {
+	review: "审查暂存的 Git 更改，检查 bug、安全问题和逻辑错误",
+	test: "为函数或组件编写全面的测试用例",
+	fix: "调试并修复问题，包含根因分析",
+	refactor: "重构代码以提升可读性和可维护性",
+	doc: "添加或改进文档和注释",
+explain: "用简洁的语言解释代码或架构",
+	commit: "根据暂存更改生成约定式提交信息",
+	"pi-system": "查看 pi 的默认系统提示词（身份、工具、行为准则）",
+	"skill-discipline": "技能执行纪律：何时及如何触发 agent 技能的规则",
+};
+
+/** 内置 prompt 模板的英文 description 映射（fallback） */
+const BUILTIN_PROMPT_DESC_EN: Record<string, string> = {
+	review: "Review staged git changes for bugs, security issues, and logic errors",
+	test: "Write tests for a function or component covering edge cases",
+	fix: "Debug and fix issues with root cause analysis",
+	refactor: "Refactor code for better readability and maintainability",
+	doc: "Add or improve documentation and comments",
+	explain: "Explain code or architecture in simple terms",
+	commit: "Generate a conventional commit message from staged changes",
+	"pi-system": "View pi's default system prompt (identity, tools, guidelines)",
+	"skill-discipline": "Skills execution discipline: rules for when and how to trigger agent skills",
+};
+
+/**
+ * 翻译内置 prompt 模板的 description（UI 展示用）。
+ * 非内置模板保持原样。
+ */
+export function translateBuiltinPromptDescription(
+	template: PromptTemplateInfo,
+): string {
+	if (!template.path.startsWith("builtin://")) return template.description;
+	// 根据 html[data-theme] 判断语言环境——中文用 CN 映射，其余用 EN
+	const isChinese =
+		typeof document !== "undefined" &&
+		document.documentElement.lang?.startsWith("zh");
+	const map = isChinese ? BUILTIN_PROMPT_DESC_CN : BUILTIN_PROMPT_DESC_EN;
+	return map[template.name] ?? template.description;
+}
+
+/** 移除 markdown frontmatter 块（--- 包裹的元数据），仅返回正文。
+ *  prompt 模板的 content 包含完整原始内容（含 frontmatter），
+ *  展开时需剥离 frontmatter，避免 `---\ndescription: xxx\n---` 污染对话消息。 */
+function stripFrontmatter(raw: string): string {
+	return raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
+}
 
 /**
  * 展开消息中的 prompt template 命令（/templateName）。
@@ -44,29 +139,46 @@ export type PromptTemplateInfo = {
  * - 只匹配后跟空格或行尾的 /name，防止部分匹配
  * - 单次正则遍历，不会级联展开替换后的内容
  * - 未找到的模板名保持原样，由 pi 兜底处理
+ * - 展开时剥离 content 中的 frontmatter，避免元数据泄漏到对话消息中
  */
 export function expandPromptTemplates(
 	message: string,
 	templates: PromptTemplateInfo[],
-): string {
-	if (!templates.length || !message.includes("/")) return message;
+): { message: string; description?: string } {
+	if (!templates.length || !message.includes("/")) return { message };
 
 	// 按 name 长度降序排序，确保正则交替时最长匹配优先
 	const sorted = [...templates].sort((a, b) => b.name.length - a.name.length);
 	const nameToContent = new Map(sorted.map((t) => [t.name, t.content]));
+	const nameToDescription = new Map(sorted.map((t) => [t.name, t.description]));
 
-	// 构建 /name1|/name2|/name3 的单一正则，避免多次替换导致级联展开
+	// 记录最后匹配到的模板名，用于提取 description 作为元数据发送给 pi agent
+	let matchedName: string | undefined;
+
+	// 构建 /name1|/name2|/name3 的单一正则，捕获命令前后的空白分隔符
 	const escapedNames = sorted.map((t) =>
 		t.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
 	);
 	const regex = new RegExp(
-		`(^|\\s)/(${escapedNames.join("|")})(?=\\s|$)`,
+		`(^|\\s)/(${escapedNames.join("|")})(\\s|$)`,
 		"g",
 	);
 
-	return message.replace(regex, (_match, prefix, name) => {
-		return prefix + (nameToContent.get(name) ?? "/" + name);
+	const expanded = message.replace(regex, (_match, prefix, name, suffix) => {
+		matchedName = name;
+		const rawContent = nameToContent.get(name) ?? "/" + name;
+		// 剥离 content 中的 frontmatter 元数据，只保留正文，
+		// 避免 `---\ndescription: xxx\n---` 泄漏到 pi agent 的对话消息中。
+		const content = stripFrontmatter(rawContent);
+		// 命令后有用户输入时用两个换行分隔模板内容和用户输入，提升可读性
+		const separator = suffix && /\s/.test(suffix) ? "\n\n" : "";
+		return prefix + content + separator;
 	});
+
+	return {
+		message: expanded,
+		description: matchedName ? nameToDescription.get(matchedName) : undefined,
+	};
 }
 
 

@@ -51,6 +51,8 @@ import {
   buildComposerPromptSubmission,
   expandPromptTemplates,
   getComposerEnterIntent,
+  parseArgumentHint,
+  translateBuiltinPromptDescription,
 } from "./composerBehavior";
 import {
   getProjectAgentSessionDisplay,
@@ -93,6 +95,7 @@ import {
   ProjectContextMenu,
   PromptSuggestions,
   SessionContextMenu,
+  SessionFileSummary,
   SessionManagerModal,
   SessionStatus,
 
@@ -503,7 +506,7 @@ export function App() {
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [promptTemplatePickerOpen, setPromptTemplatePickerOpen] = useState(false);
   const [promptTemplateList, setPromptTemplateList] = useState<
-    Array<{ name: string; path: string; description: string; content: string }>
+    Array<{ name: string; path: string; description: string; content: string; argumentHint?: string }>
   >([]);
   const [composerModePickerOpen, setComposerModePickerOpen] = useState(false);
   const [thinkingPickerOpen, setThinkingPickerOpen] = useState(false);
@@ -1255,8 +1258,11 @@ export function App() {
     [commands],
   );
   const validCommandNames = useMemo(
-    () => new Set(mergedCommands.map((c) => c.name)),
-    [mergedCommands],
+    () => new Set([
+      ...mergedCommands.map((c) => c.name),
+      ...promptTemplateList.map((t) => t.name),
+    ]),
+    [mergedCommands, promptTemplateList],
   );
 
   /** 有效文件路径白名单：仅工作区真实存在的 @ 引用渲染为 chip */
@@ -3204,7 +3210,13 @@ export function App() {
     const allTemplates: typeof promptTemplateList = [];
     try {
       const globalResult = await api.prompts.list();
-      allTemplates.push(...globalResult.templates);
+      for (const tpl of globalResult.templates) {
+        allTemplates.push({
+            ...tpl,
+            description: translateBuiltinPromptDescription(tpl),
+            argumentHint: parseArgumentHint(tpl.content),
+        });
+      }
     } catch {
       // 全局列表失败时继续加载项目列表
     }
@@ -3229,6 +3241,7 @@ export function App() {
     path: string;
     description: string;
     content: string;
+    argumentHint?: string;
   }) {
     // 插入斜线命令形式，pi 会在发送时自动展开，末尾加空格分割后续输入
     setPrompt((prev) => {
@@ -3562,6 +3575,7 @@ ${text}
         api.agents.prompt({
           agentId: activeAgentId,
           message: continuationMsg,
+          description: "[goal 自动续接]",
           streamingBehavior: "followUp",
         }).catch(() => {
           goalContinuationPendingRef.current = false;
@@ -3635,8 +3649,9 @@ ${text}
 
     // 在发送前本地展开 prompt template 命令（/name → 完整内容），
     // 避免依赖 pi 的展开导致用户附加文本丢失以及特殊符号干扰
-    const expandedMessage = expandPromptTemplates(message, promptTemplateList);
-    await submitPromptSnapshot(activeAgentId, expandedMessage, images, undefined, currentComposerAgentMode);
+    // 同时提取模板的 description 作为元数据发给 pi agent，让其了解本次 prompt 意图
+    const { message: expandedMessage, description: templateDescription } = expandPromptTemplates(message, promptTemplateList);
+    await submitPromptSnapshot(activeAgentId, expandedMessage, images, undefined, currentComposerAgentMode, templateDescription);
   }
 
   async function sendPromptAsFollowUp() {
@@ -3766,6 +3781,8 @@ ${goalTextRef.current}
     images?: ImageContent[],
     streamingBehavior?: "steer" | "followUp",
     agentMode: ComposerAgentMode = "normal",
+    /** prompt 模板匹配到的 description，作为元数据发给 pi agent 标识意图 */
+    templateDescription?: string,
   ) {
     // 这里接收快照参数,让 composer 发送和历史消息"重新发送"共享同一条路径。
     // Agent 忙碌时显式使用官方 streamingBehavior=steer:消息会进入 pi 的运行中队列,
@@ -3777,6 +3794,7 @@ ${goalTextRef.current}
       message: submission.message,
       images,
       ...(submission.agentMessage ? { agentMessage: submission.agentMessage } : {}),
+      ...(templateDescription ? { description: templateDescription } : {}),
       ...(behavior ? { streamingBehavior: behavior } : {}),
     });
   }
@@ -4453,7 +4471,6 @@ ${goalTextRef.current}
                   onDragEnd={finishProjectDrag}
                   onContextMenu={(event) => {
                     event.preventDefault();
-                    if (projectIsChat) return;
                     setProjectMenu({
                       ...adjustMenuPos(event.clientX, event.clientY, 200, 320),
                       project,
@@ -5176,7 +5193,6 @@ ${goalTextRef.current}
                       onDiffFile={diffFilePath}
                       onEditMessage={editMessage}
                       onDeleteMessage={deleteMessage}
-                      fileSummariesByMessage={turnFileSummaryByMessage}
                       onEnterMultiSelect={() => setMultiSelectOpen(true)}
                     />
                   );
@@ -5339,6 +5355,13 @@ ${goalTextRef.current}
               </div>
             );
           })()}
+          {/* 会话文件修改摘要：位于扩展 widget 与输入框之间，默认折叠，可展开查看所有修改文件 */}
+          {activeAgentId && sessionFileSummaryByAgent[activeAgentId] && (
+            <SessionFileSummary
+              files={sessionFileSummaryByAgent[activeAgentId]}
+              onDiffFile={diffFilePath}
+            />
+          )}
           <div
             ref={composerBoxRef}
             className={`composer-box ${
