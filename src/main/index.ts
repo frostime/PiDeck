@@ -10,7 +10,7 @@ import {
 	Tray,
 } from "electron";
 import { randomUUID } from "node:crypto";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { createWriteStream, existsSync } from "node:fs";
 import { copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { is } from "@electron-toolkit/utils";
@@ -24,6 +24,12 @@ import {
 import iconPath from "../../build/icon.png?asset";
 
 applyLinuxDisplayBackendWorkaround();
+
+// Windows 上部分安全软件 / 旧 GPU 驱动会导致 Chromium 沙箱初始化触发原生断点异常（0x80000003），
+// 全局禁用沙箱。VS Code、Discord 等知名 Electron 桌面工具在 Windows 上同样默认禁用沙箱。
+if (process.platform === "win32") {
+	app.commandLine.appendSwitch("no-sandbox");
+}
 
 // 开发模式下 stdout 管道可能断开导致 EPIPE 崩溃，全局静默处理
 process.stdout.on("error", (err: NodeJS.ErrnoException) => {
@@ -615,6 +621,7 @@ async function createWindow() {
 			sandbox: false,
 			contextIsolation: true,
 			nodeIntegration: false,
+			webviewTag: true,
 		},
 	});
 	const createdWindow = mainWindow;
@@ -1184,6 +1191,16 @@ function registerIpc() {
 	ipcMain.handle(
 		ipcChannels.projectsToggleWorktreeEnabled,
 		async (_event, projectId: string) => {
+			const existing = projectStore.get(projectId);
+			if (!existing) throw new Error(`Project not found: ${projectId}`);
+			// 即将启用时先校验是否 git 仓库；非 git 项目开启工作区模式没有意义，
+			// 只会看到空列表并在创建时报错，这里提前给出明确错误让前端提示用户。
+			if (!existing.worktreeEnabled) {
+				const isRepo = await gitService.isGitRepo(existing.path);
+				if (!isRepo) {
+					throw new Error("NOT_A_GIT_REPO");
+				}
+			}
 			const project = await projectStore.toggleWorktreeEnabled(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
 			// 开启 worktree 模式时，自动注册已有的 git worktree
@@ -1214,6 +1231,11 @@ function registerIpc() {
 		const error = await shell.openPath(path);
 		// Electron 通过返回字符串报告打开失败；显式抛出后前端才能提示路径不存在或系统无法打开。
 		if (error) throw new Error(error);
+	});
+
+	ipcMain.handle(ipcChannels.browserOpenExternal, async (_event, url: string) => {
+		// shell.openExternal 使用系统默认浏览器打开链接，可控且安全。
+		await shell.openExternal(url);
 	});
 
 	ipcMain.handle(ipcChannels.filesReadContent, async (_event, path: string) => {
@@ -1527,11 +1549,22 @@ function registerIpc() {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
 			const ok = await worktreeService.remove(worktreePath, project.path);
-			if (ok) {
+			const normalizeForCompare = (value: string) => {
+				const resolved = resolve(value);
+				return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+			};
+			const normalizedTarget = normalizeForCompare(worktreePath);
+			const stillInGit = (await worktreeService.list(project.path)).some(
+				(entry) => normalizeForCompare(entry.path) === normalizedTarget,
+			);
+			// 如果 git 已经没有该 worktree（包括用户在外部删过导致 remove 返回 false），
+			// 也要清理 PiDeck 项目记录，否则重启后会从 projects.json 恢复成“删不掉”。
+			if (ok || !stillInGit) {
 				const child = projectStore.findByPath(worktreePath);
 				if (child) await projectStore.remove(child.id);
+				return true;
 			}
-			return ok;
+			return false;
 		},
 	);
 

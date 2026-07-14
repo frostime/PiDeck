@@ -1,7 +1,7 @@
 import { app, type BrowserWindow, Notification } from "electron";
 import { randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import type {
@@ -20,7 +20,8 @@ import { ipcChannels } from "../../shared/ipc";
 import { PiProcess } from "./PiProcess";
 import type { RpcResponse } from "./PiRpcClient";
 import { formatBashToolMessage } from "./bashResult";
-import { stripFeishuDocActionHint } from "../feishu/docActions";
+import { extractMessageText } from "./messageContent";
+import { mergeHistoryWithPreservedMessages } from "./historyMessages";
 import type { SettingsStore } from "../settings/SettingsStore";
 import type { ConfigManager } from "../config/ConfigManager";
 import type { RpcLogger } from "../logging/RpcLogger";
@@ -55,6 +56,17 @@ export class AgentManager {
 	/** 流式 emit 合并窗口（毫秒）。50ms 兼顾流畅度与传输量，肉眼几乎无延迟。 */
 	private static readonly MESSAGE_FLUSH_INTERVAL_MS = 50;
 	/**
+	 * agent_end 后等待 agent_settled 的超时时间（毫秒）。
+	 * 如果 Pi 在此时间内未发送 agent_settled，桌面端将主动查询 get_state 并尝试恢复 idle。
+	 * 这补偿了 Pi 在某些边缘情况下不发送 agent_settled 导致动画永久卡住的问题。
+	 */
+	private static readonly AGENT_SETTLED_TIMEOUT_MS = 5000;
+	/**
+	 * 超过该大小的历史会话不自动 get_messages。
+	 * pi 当前不支持 limit/cursor，40MB JSONL 会以单行大 JSON 返回，主进程 JSON.parse 会短暂冻结整个应用。
+	 */
+	private static readonly MAX_AUTO_HISTORY_LOAD_BYTES = 8 * 1024 * 1024;
+	/**
 	 * 工具结果文本截断阈值（字符数）。工具结果（如 bash 输出、文件读取）可能达数十 KB，
 	 * 若完整存入 ChatMessage.meta 并随流式 emit 反复全量传输，会显著放大 IPC payload
 	 * 并推高渲染进程内存，是大会话白屏的重要诱因。超长结果保留首尾各一部分，中间省略。
@@ -66,8 +78,14 @@ export class AgentManager {
 	private readonly stateListeners = new Set<(tabs: AgentTab[]) => void>();
 	/** 开启了 RPC 日志记录的 agent id 集合 */
 	private readonly rpcLoggingAgents = new Set<string>();
-	/** 正在执行压缩操作的 agent，用于区分压缩重启和异常崩溃 */
+	/** 正在执行手动压缩操作的 agent，用于区分手动压缩重启和异常崩溃 */
 	private readonly compactingAgents = new Set<string>();
+	/**
+	 * Pi 通过事件报告正在自动/手动压缩的 agent。
+	 * 自动压缩发生在 agent_end 之后，桌面端若不单独追踪，会过早把会话置为 idle，
+	 * 用户随后发送的新消息可能撞上 Pi 内部 compaction，表现为“会话中断”。
+	 */
+	private readonly rpcCompactingAgents = new Set<string>();
 	/** 用户主动停止的 agent，用于退出处理器中跳过自动重连 */
 	private readonly userInitiatedStop = new Set<string>();
 	/** 已尝试过自动重连的 agent（防止无限循环），重连成功后清除 */
@@ -122,7 +140,12 @@ export class AgentManager {
 		return this.requireRuntime(agentId).tab.cwd;
 	}
 
-	async loadMessages(agentId: string, skipEntries = false, earlyMessagesPromise?: Promise<RpcResponse>) {
+	async loadMessages(
+		agentId: string,
+		skipEntries = false,
+		earlyMessagesPromise?: Promise<RpcResponse>,
+		options?: { preserveMessagesAfter?: number },
+	) {
 		const t0 = Date.now();
 		const runtime = this.requireRuntime(agentId);
 
@@ -165,12 +188,26 @@ export class AgentManager {
 
 		const messages = this.convertAgentMessages(agentId, trimmed, activeEntryIds);
 		const t2 = Date.now();
+		void this.appLogger?.info("agent", "Agent messages loaded", {
+			agentId,
+			skipEntries,
+			rawMessages: rawMessages.length,
+			trimmedMessages: trimmed.length,
+			requestMs: t1 - t0,
+			convertMs: t2 - t1,
+			totalMs: t2 - t0,
+		});
 		// abort 时 ask_question 的 answer 已被覆写为 null，不再需要跟踪
 		this.abortedDuringAsk.delete(agentId);
-		this.messages.set(agentId, messages);
+		const nextMessages = mergeHistoryWithPreservedMessages(
+			messages,
+			this.messages.get(agentId) ?? [],
+			options?.preserveMessagesAfter,
+		);
+		this.messages.set(agentId, nextMessages);
 		this.refreshAutoTitle(agentId);
 		this.scheduleMessageEmit(agentId, true);
-		return messages;
+		return nextMessages;
 	}
 
 	async create(input: CreateAgentInput) {
@@ -194,6 +231,20 @@ export class AgentManager {
 
 	private normalizeSessionPathForCompare(sessionPath?: string) {
 		return sessionPath?.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+	}
+
+	private getHistoryAutoLoadDecision(sessionPath?: string): { shouldLoad: boolean; sizeBytes?: number } {
+		if (!sessionPath) return { shouldLoad: true };
+		try {
+			const sizeBytes = statSync(sessionPath).size;
+			return {
+				shouldLoad: sizeBytes <= AgentManager.MAX_AUTO_HISTORY_LOAD_BYTES,
+				sizeBytes,
+			};
+		} catch {
+			// 无法读取大小时保留旧行为尝试加载，避免临时文件/权限异常直接导致历史不可见。
+			return { shouldLoad: true };
+		}
 	}
 
 	private findRuntimeBySessionKey(sessionKey: string) {
@@ -243,6 +294,12 @@ export class AgentManager {
 		const t2 = Date.now();
 
 		const process = new PiProcess(project.path, this.settingsStore.get());
+		process.on("version-check", (payload) => {
+			void this.appLogger?.info("agent", "Pi version check completed", {
+				agentId: id,
+				...(payload && typeof payload === "object" ? payload : {}),
+			});
+		});
 		const runtime: AgentRuntime = { tab, process };
 		this.agents.set(id, runtime);
 		this.messages.set(id, []);
@@ -250,10 +307,20 @@ export class AgentManager {
 
 		const client = process.start(input.sessionPath, trustOverride);
 		const t3 = Date.now();
+		void this.appLogger?.info("agent", "Pi process spawned", {
+			agentId: id,
+			prepareMs: t1 - t0,
+			trustMs: t2 - t1,
+			spawnCallMs: t3 - t2,
+		});
 
-		// 启动后立即连续发送两条命令，让 pi 启动后一次性处理，减少空闲等待
+		// 启动后立即获取状态；历史消息仅在文件不大时预取。
+		// 大会话 get_messages 会返回超大单行 JSON，JSON.parse 会阻塞 Electron 主进程，宁可先让 Agent 可用。
 		const statePromise = client.request({ type: "get_state" });
-		const messagesPromise = client.request({ type: "get_messages" });
+		const historyLoadDecision = this.getHistoryAutoLoadDecision(input.sessionPath);
+		const messagesPromise = historyLoadDecision.shouldLoad
+			? client.request({ type: "get_messages" })
+			: undefined;
 
 		// ... 事件监听器（省略，与原来一致）
 		process.on("event", (event) => this.handlePiEvent(id, event));
@@ -361,6 +428,11 @@ export class AgentManager {
 		try {
 			const state = await statePromise;
 			const t4 = Date.now();
+			void this.appLogger?.info("agent", "Agent get_state completed", {
+				agentId: id,
+				stateMs: t4 - t3,
+				totalSinceCreateMs: t4 - t0,
+			});
 			const data = state.data as
 				| { sessionId?: string; sessionFile?: string; sessionName?: string }
 				| undefined;
@@ -373,13 +445,65 @@ export class AgentManager {
 					? `${project.name} 历史会话`
 					: `${project.name} agent`);
 			tab.status = "idle";
-			// 加载历史消息（跳过 get_entries，编辑/删除时按需加载），最多重试一次
-			await this.loadMessages(id, true, messagesPromise)
-				.catch(() =>
-					new Promise<void>((resolve) => setTimeout(resolve, 800))
-						.then(() => this.loadMessages(id, true)),
-				)
-				.catch(() => undefined);
+			// 大历史会话的 get_messages 可能需要十几秒；Agent 可用只依赖 get_state，
+			// 因此历史消息后台加载，避免 40MB+ 会话把“打开 Agent”阻塞到十几秒。
+			// 同时插入一条临时系统消息，给用户明确的加载反馈，避免空白页面看起来像冻结。
+			// preserveMessagesAfter 保护加载期间用户新发的消息/流式回复，防止历史结果回写时覆盖当前会话。
+			const preserveMessagesAfter = Date.now();
+			if (messagesPromise) {
+				if (input.sessionPath) {
+					this.addMessage(id, "system", "正在加载历史会话，大会话可能需要几秒钟…", {
+						historyLoading: true,
+					});
+				}
+				void this.loadMessages(id, true, messagesPromise, { preserveMessagesAfter })
+					.catch(() =>
+						new Promise<void>((resolve) => setTimeout(resolve, 800))
+							.then(() => this.loadMessages(id, true, undefined, { preserveMessagesAfter })),
+					)
+					.then(() => {
+						void this.appLogger?.info("agent", "Agent history loaded in background", {
+							agentId: id,
+							totalMs: Date.now() - preserveMessagesAfter,
+						});
+					})
+					.catch((error) => {
+						const list = this.messages.get(id) ?? [];
+						const loadingMessage = list.find((message) => message.meta?.historyLoading === true);
+						if (loadingMessage) {
+							loadingMessage.role = "error";
+							loadingMessage.text = "历史会话加载失败，可继续使用当前 Agent 或重新打开会话重试。";
+							loadingMessage.meta = { historyLoading: "failed" };
+							loadingMessage.timestamp = Date.now();
+							this.scheduleMessageEmit(id, true);
+						}
+						void this.appLogger?.warn("agent", "Agent history background load failed", {
+							agentId: id,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					});
+			} else if (input.sessionPath) {
+				this.addMessage(
+					id,
+					"system",
+					"历史会话文件较大，已跳过自动加载以避免界面冻结；Agent 已可继续使用。",
+					{
+						historyLoading: "skipped-large-session",
+						sessionSizeBytes: historyLoadDecision.sizeBytes,
+					},
+				);
+				void this.appLogger?.info("agent", "Agent history auto-load skipped", {
+					agentId: id,
+					sessionPath: input.sessionPath,
+					sizeBytes: historyLoadDecision.sizeBytes,
+					maxAutoLoadBytes: AgentManager.MAX_AUTO_HISTORY_LOAD_BYTES,
+				});
+			}
+			void this.appLogger?.info("agent", "Agent create completed", {
+				agentId: id,
+				totalMs: Date.now() - t0,
+				historyLoading: "background",
+			});
 		} catch (error) {
 			tab.status = "error";
 			const rawMessage = error instanceof Error ? error.message : String(error);
@@ -882,8 +1006,34 @@ export class AgentManager {
 			};
 			this.emit(ipcChannels.agentsRpcLog, logEntry);
 		});
-		// 重连后的进程再次退出 → 不再自动重连，防止无限循环
-		process.on("exit", () => {
+		process.on("exit", (payload: { code: number | null; signal: string | null }) => {
+			if (this.userInitiatedStop.has(agentId)) {
+				this.userInitiatedStop.delete(agentId);
+				runtime.tab.status = "closed";
+				this.emitState();
+				return;
+			}
+
+			// 自动压缩也可能发生在重连后的进程中；继续复用同一会话文件重附加，
+			// 但仍用 autoRestartAttempted 做单次保护，避免真正异常退出时无限重启。
+			if (!this.autoRestartAttempted.has(agentId) && runtime.tab.sessionPath && payload.code === 0) {
+				this.autoRestartAttempted.add(agentId);
+				runtime.tab.status = "starting";
+				this.emitState();
+				this.reattachProcess(agentId, runtime.tab.sessionPath)
+					.then(() => {
+						runtime.tab.status = "idle";
+						this.addMessage(agentId, "system", "会话压缩完成，Agent 已自动重连");
+						this.emitState();
+					})
+					.catch(() => {
+						runtime.tab.status = "closed";
+						this.addMessage(agentId, "error", "Agent 进程意外退出，自动重连失败");
+						this.emitState();
+					});
+				return;
+			}
+
 			runtime.tab.status = "closed";
 			this.emitState();
 		});
@@ -905,6 +1055,8 @@ export class AgentManager {
 			runtime.tab.sessionPath = data?.sessionFile ?? sessionPath;
 			runtime.tab.title = data?.sessionName ?? runtime.tab.title;
 			runtime.tab.status = "idle";
+			// 进程退出型压缩可能来不及发 compaction_end；重连成功即表示 Pi 已可继续接收消息。
+			this.rpcCompactingAgents.delete(agentId);
 
 			// 重连成功后清除自动重连标记，允许下一次再触发
 			this.autoRestartAttempted.delete(agentId);
@@ -1026,7 +1178,10 @@ export class AgentManager {
 			modelId: model?.id,
 			thinkingLevel: state?.thinkingLevel,
 			isStreaming: state?.isStreaming,
-			isCompacting: state?.isCompacting,
+			isCompacting:
+				state?.isCompacting ||
+				this.rpcCompactingAgents.has(agentId) ||
+				this.compactingAgents.has(agentId),
 			/** 工具执行状态从本地追踪，无需 Pi 进程查询 */
 			isExecutingTool: !!(this.toolExecutingByAgent.get(agentId)),
 			executingToolName: this.toolExecutingByAgent.get(agentId) ?? undefined,
@@ -1044,6 +1199,15 @@ export class AgentManager {
 			cacheHitPercent,
 			cost: stats?.cost,
 		};
+	}
+
+	private async emitRuntimeState(agentId: string) {
+		try {
+			const state = await this.getRuntimeState(agentId);
+			this.emit(ipcChannels.agentsRuntimeState, { agentId, state });
+		} catch {
+			// 运行态刷新失败不影响主流程；下一次轮询或事件会继续同步。
+		}
 	}
 
 	private pickNumber(...values: unknown[]) {
@@ -1885,12 +2049,33 @@ export class AgentManager {
 		// 自动/手动压缩事件（pi 在自动或手动压缩完成后会发出这些事件），
 		// 用于记录压缩耗时和结果，便于排查压缩性能问题。
 		if (typed.type === "compaction_start") {
+			this.rpcCompactingAgents.add(agentId);
+			if (runtime) {
+				// 自动压缩在 agent_end 之后触发：Pi 仍在改写上下文，但不会再发 agent_start。
+				// 因此桌面端必须主动保持 running，阻止用户误以为空闲并继续发送消息。
+				runtime.tab.status = "running";
+				this.emitState();
+				void this.emitRuntimeState(agentId);
+			}
 			void this.appLogger?.info("agent", "Compaction started", {
 				agentId,
 				reason: typed.reason,
 			});
 		}
 		if (typed.type === "compaction_end") {
+			this.rpcCompactingAgents.delete(agentId);
+			if (runtime) {
+				// compaction 会向 session JSONL 写入新的边界记录；立即重载消息，
+				// 避免前端仍展示压缩前分支，下一轮继续对话时看起来像“断在旧会话”。
+				void this.loadMessages(agentId).catch(() => undefined);
+				if (runtime.tab.status !== "error") {
+					// compaction_end 之后 Pi 仍可能因 overflow retry 或 queued follow-up 自动继续。
+					// 只有 agent_settled 才表示不会再自动发起下一轮，不能在这里提前 idle。
+					runtime.tab.status = "running";
+				}
+				this.emitState();
+				void this.emitRuntimeState(agentId);
+			}
 			void this.appLogger?.info("agent", "Compaction ended", {
 				agentId,
 				reason: typed.reason,
@@ -1902,15 +2087,11 @@ export class AgentManager {
 		}
 
 		if (typed.type === "agent_end") {
-			// 即使 runtime 已被清理（如用户快速切换/停止 agent），仍需向会话写入错误提示，
-			// 否则用户会看到发送后完全空白、没有任何反馈。
+			// agent_end 只表示一次底层 run 结束；Pi 之后仍可能执行自动重试、自动压缩，
+			// 或压缩后继续 queued follow-up。最终空闲必须等 agent_settled，避免中途误判 idle。
 			if (runtime) {
-				runtime.tab.status = "idle";
-				// 清理流式思考状态
-				this.streamingThinking.delete(agentId);
 				this.activeAssistantMessageIds.delete(agentId);
 				this.toolMessageIds.delete(agentId);
-				this.emitThinking(agentId, "");
 			}
 			// agent 异常结束时（如 API 返回 400、模型报错等），将错误提示写入会话，避免用户看到空白。
 			// 错误信息的存放位置因 pi 版本和错误类型不同而有多种可能：
@@ -1970,19 +2151,37 @@ export class AgentManager {
 				if (runtime) runtime.tab.status = "error";
 			}
 			if (runtime) this.emitState();
-			// 同步刷新 runtimeState，将 isStreaming 重置为 false；
-			// 否则前端 isAgentBusy 依赖的 isStreaming 仍为过期的 true，导致排队 flush 无法触发。
-			void this.getRuntimeState(agentId)
-				.then((state) =>
-					this.emit(ipcChannels.agentsRuntimeState, { agentId, state }),
-				)
-				.catch(() => undefined);
-			// 会话结束时发送系统通知，让用户知道 agent 已完成工作
-			// 只在最后一条消息是 assistant 消息时通知，避免工具调用结束时也触发通知
-			const messages = this.messages.get(agentId) ?? [];
-			const lastMessage = messages[messages.length - 1];
-			if (lastMessage?.role === "assistant" && runtime) {
-				this.notifySessionEnd(runtime.tab.title);
+			// agent_end 后 runtimeState 可能暂时仍显示后续 compaction/retry；立即同步一次，
+			// 但不要把它当作最终空闲信号，最终状态由 agent_settled 处理。
+			void this.emitRuntimeState(agentId);
+
+			// 兜底：如果 Pi 由于某些边缘情况未发送 agent_settled，
+			// 定时查询 get_state 确认是否已无工作可做，避免 UI 动画永久卡住。
+			// agent_settled 正常触发时 markIdleIfPiReportsNoWork 会因 status!=="running" 提前返回。
+			const settledTimer = setTimeout(() => {
+				void this.markIdleIfPiReportsNoWork(agentId);
+			}, AgentManager.AGENT_SETTLED_TIMEOUT_MS);
+			settledTimer.unref?.();
+		}
+
+		if (typed.type === "agent_settled") {
+			if (runtime && runtime.tab.status !== "error" && runtime.tab.status !== "closed") {
+				// agent_settled 是 Pi 的最终稳定点：没有自动重试、自动压缩、压缩 retry
+				// 或 queued follow-up 会继续执行，此时才允许恢复 idle 并通知用户完成。
+				runtime.tab.status = "idle";
+				this.streamingThinking.delete(agentId);
+				this.activeAssistantMessageIds.delete(agentId);
+				this.toolMessageIds.delete(agentId);
+				this.rpcCompactingAgents.delete(agentId);
+				this.emitThinking(agentId, "");
+				this.emitState();
+				void this.emitRuntimeState(agentId);
+
+				const messages = this.messages.get(agentId) ?? [];
+				const lastMessage = messages[messages.length - 1];
+				if (lastMessage?.role === "assistant") {
+					this.notifySessionEnd(runtime.tab.title);
+				}
 			}
 		}
 
@@ -3095,6 +3294,7 @@ export class AgentManager {
 		const runtime = this.agents.get(agentId);
 		if (!runtime || runtime.tab.status !== "running") return;
 		if ((this.pendingUIRequests.get(agentId)?.size ?? 0) > 0) return;
+		if (this.rpcCompactingAgents.has(agentId) || this.compactingAgents.has(agentId)) return;
 		if (this.activeAssistantMessageIds.has(agentId)) return;
 		if (this.toolExecutingByAgent.get(agentId)) return;
 
@@ -3138,25 +3338,7 @@ export class AgentManager {
 	}
 
 	private extractText(content: unknown): string {
-		if (typeof content === "string") return stripFeishuDocActionHint(content);
-		if (Array.isArray(content)) {
-			const text = content
-				.map((item) => {
-					if (typeof item === "string") return item;
-					if (item && typeof item === "object") {
-						const typed = item as any;
-						if (typed.type === "image") return "";
-						// thinking 块以 <thinking> 标签嵌入 text，保留原始交替顺序
-						if (typed.type === "thinking") return `<thinking>${String(typed.thinking ?? "")}</thinking>`;
-						return String(typed.text ?? "");
-					}
-					return "";
-				})
-				.filter(Boolean)
-				.join("\n");
-			return stripFeishuDocActionHint(text);
-		}
-		return "";
+		return extractMessageText(content);
 	}
 
 	/** 从 pi 历史消息 content 中恢复图片附件，用于历史会话重新打开后的图片展示。 */

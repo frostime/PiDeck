@@ -37,6 +37,7 @@ import {
   Terminal,
   Filter,
   GitBranch,
+  RefreshCw,
   X,
 } from "lucide-react";
 import { createPreviewApi } from "./previewApi";
@@ -110,6 +111,7 @@ import {
   type DrawerPanel,
   type SessionModifiedFile,
 } from "./components/app/AppParts";
+import { BrowserPanel } from "./components/app/BrowserPanel";
 import {
   groupToolMessages,
   applySuggestion,
@@ -360,6 +362,44 @@ function resolveFileLinkPath(path: string, basePath?: string) {
   return `${basePath.replace(/[\\/]+$/, "")}${separator}${path.replace(/^[\\/]+/, "")}`;
 }
 
+const DISMISSED_EXTENSION_WIDGETS_STORAGE_KEY =
+  "pid:extension-widget-dismissed-by-session";
+
+function loadDismissedExtensionWidgets(): Record<string, string[]> {
+  try {
+    const parsed = JSON.parse(
+      localStorage.getItem(DISMISSED_EXTENSION_WIDGETS_STORAGE_KEY) ?? "{}",
+    );
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const result: Record<string, string[]> = {};
+    for (const [sessionKey, widgetKeys] of Object.entries(parsed)) {
+      if (Array.isArray(widgetKeys)) {
+        result[sessionKey] = widgetKeys.filter(
+          (widgetKey): widgetKey is string => typeof widgetKey === "string",
+        );
+      }
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+function saveDismissedExtensionWidgets(value: Record<string, string[]>) {
+  try {
+    localStorage.setItem(
+      DISMISSED_EXTENSION_WIDGETS_STORAGE_KEY,
+      JSON.stringify(value),
+    );
+  } catch {
+    // localStorage 可能因隐私模式/配额失败；关闭状态丢失不应影响主流程。
+  }
+}
+
+function getAgentSessionStorageKey(agent?: AgentTab, fallbackAgentId?: string) {
+  return agent?.sessionPath ?? fallbackAgentId ?? "";
+}
+
 
 type PendingAgentTab = AgentTab & {
   pendingKind?: "create" | "restart";
@@ -531,6 +571,10 @@ export function App() {
   const [externalEditors, setExternalEditors] = useState<ExternalEditor[]>([]);
   const [editorsOpen, setEditorsOpen] = useState(false);
   const [editorsAnchor, setEditorsAnchor] = useState<{ x: number; y: number } | null>(null);
+  /** 右键项目也能唤起编辑器气泡，所以这里显式记录本次要打开的目录，避免依赖运行中 agent 的 cwd。 */
+  const [editorsTargetPath, setEditorsTargetPath] = useState<string | null>(null);
+  /** 浏览器全屏模式：在完整窗口覆盖层中渲染浏览器面板，不受右侧抽屉宽度限制。 */
+  const [browserFullscreen, setBrowserFullscreen] = useState(false);
   const editorsRef = useRef<HTMLDivElement>(null);
 
   // 点击编辑器气泡外部时关闭
@@ -539,6 +583,8 @@ export function App() {
     const handler = (event: MouseEvent) => {
       if (editorsRef.current && !editorsRef.current.contains(event.target as Node)) {
         setEditorsOpen(false);
+        setEditorsAnchor(null);
+        setEditorsTargetPath(null);
       }
     };
     document.addEventListener("mousedown", handler);
@@ -550,14 +596,21 @@ export function App() {
   const [extensionWidgetsByAgent, setExtensionWidgetsByAgent] = useState<
     Record<string, Record<string, string[]>>
   >({});
-  /** Extension widget �ۺ�/չ��״̬���� agent ��������һ���л�ʱ������ */
-  const [widgetsCollapsedByAgent, setWidgetsCollapsedByAgent] = useState<
-    Record<string, boolean>
-  >({});
-  /** 用户手动关闭的 extension widget（widgetKey） */
+  /** Extension widget 容器折叠状态（全局持久化，不按 agentId 隔离，重启后恢复） */
+  const [widgetsCollapsed, setWidgetsCollapsed] = useState(() => {
+    try {
+      return (
+        JSON.parse(localStorage.getItem("pid:extension-widgets-collapsed") ?? "false") ??
+        false
+      );
+    } catch {
+      return false;
+    }
+  });
+  /** 用户手动关闭的 extension widget（widgetKey）；按稳定 sessionPath 隔离，避免切换 agent 串状态。 */
   const [agentDismissedWidgets, setAgentDismissedWidgets] = useState<
     Record<string, string[]>
-  >({});
+  >(() => loadDismissedExtensionWidgets());
   /** 输入框发送模式：normal 直接交给 agent，plan 通过隐藏标记触发 PiDeck Plan Mode 扩展。 */
   const [composerAgentModes, setComposerAgentModes] = useState<Record<string, ComposerAgentMode>>({});
   /** 当前 agent 的发送模式，按 agentId 隔离。 */
@@ -687,6 +740,16 @@ export function App() {
   const [worktreeCreateDialog, setWorktreeCreateDialog] = useState<{
     projectId: string;
   } | null>(null);
+  /** worktree 创建进行中，用于禁用弹框按钮并显示"创建中" */
+  const [worktreeCreating, setWorktreeCreating] = useState(false);
+  /** 展开会话的 worktree 路径集合：默认子工作区只展示 3 条会话，展开后显示全部 */
+  const [expandedWorktreeSessions, setExpandedWorktreeSessions] = useState<
+    Set<string>
+  >(() => new Set());
+  /** 正在被删除的 worktree 路径集合：触发淡出动画期间保留 DOM，动画结束后才移除。 */
+  const [removingWorktreePaths, setRemovingWorktreePaths] = useState<
+    Set<string>
+  >(() => new Set());
   /** 历史会话来源过滤（按项目）：undefined=显示全部，Record 含项目ID对应 Set */
   const [sessionSourceFilter, setSessionSourceFilter] = useState<
   	Record<string, Set<"pi" | "codex" | "claude" | "opencode"> | null>
@@ -2419,6 +2482,21 @@ export function App() {
     }
   }
 
+  /** 刷新项目侧栏数据：根项目会话 + worktree 列表 + worktree 子项目会话。 */
+  async function refreshProjectTree(project: Project) {
+    await refreshProjectSessions(project.id);
+    if (project.worktreeEnabled) {
+      await refreshWorktrees(project.id);
+      const latestProjects = await api.projects.list();
+      setProjects(latestProjects);
+      const childProjects = latestProjects.filter((p) => p.worktreeParentId === project.id);
+      await Promise.all(
+        childProjects.map((child) => refreshProjectSessions(child.id).catch(() => undefined)),
+      );
+    }
+    showToast(t("app.projectRefreshed"), 1800);
+  }
+
   async function refreshFiles(projectId = activeProjectId) {
     if (!projectId) return;
     const next = await api.files.list(projectId);
@@ -4122,6 +4200,7 @@ ${goalTextRef.current}
 
   /** 创建新的 git worktree 工作区 */
   async function createWorktree(projectId: string, branchName: string) {
+    setWorktreeCreating(true);
     try {
       const result = await api.git.worktreeCreate(projectId, branchName);
       // 刷新项目列表（新 worktree 已注册为项目）
@@ -4129,22 +4208,75 @@ ${goalTextRef.current}
       setProjects(next);
       // 刷新 worktree 列表
       await refreshWorktrees(projectId);
+      showToast(t("app.worktreeCreated") + result.branch);
       return result;
     } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      showToast(t("app.worktreeCreateFailed") + message, 5000);
       throw e;
+    } finally {
+      setWorktreeCreating(false);
     }
   }
 
   /** 删除 worktree 工作区 */
   async function removeWorktree(parentProjectId: string, worktreePath: string) {
     try {
-      await api.git.worktreeRemove(parentProjectId, worktreePath);
+      const removed = await api.git.worktreeRemove(parentProjectId, worktreePath);
+      if (!removed) {
+        throw new Error(t("app.worktreeRemoveNotFound"));
+      }
       const next = await api.projects.list();
       setProjects(next);
       await refreshWorktrees(parentProjectId);
+      showToast(t("app.worktreeRemoved"));
     } catch (e) {
-      console.error('Failed to remove worktree', e);
+      const message = e instanceof Error ? e.message : String(e);
+      showToast(t("app.worktreeRemoveFailed") + message, 5000);
+    } finally {
+      // 无论成功还是失败，都移除动画状态，避免 worktree 行永久隐藏
+      setRemovingWorktreePaths((prev) => {
+        const next = new Set(prev);
+        next.delete(worktreePath);
+        return next;
+      });
     }
+  }
+
+  /**
+   * 请求删除 worktree：先校验是否有运行中的 Agent，再弹确认框，确认后执行删除。
+   * 避免误删正在使用的 worktree，也保证删除结果通过 toast 反馈给用户。
+   */
+  function requestRemoveWorktree(
+    parentProjectId: string,
+    worktreePath: string,
+    childProject: Project | undefined,
+  ) {
+    const childAgents = childProject
+      ? displayAgents.filter(
+          (a) =>
+            a.projectId === childProject.id &&
+            (a.status === "running" || a.status === "starting"),
+        )
+      : [];
+    if (childAgents.length > 0) {
+      showToast(t("app.worktreeRemoveBlockedByAgents"), 5000);
+      return;
+    }
+    setConfirmDialog({
+      title: t("app.worktreeRemoveConfirmTitle"),
+      message: t("app.worktreeRemoveConfirmMessage"),
+      danger: true,
+      confirmLabel: t("common.delete"),
+      onConfirm: () => {
+        setConfirmDialog(null);
+        // 先触发淡出动画（添加 removing 类），等动画结束后再执行真实删除。
+        setRemovingWorktreePaths((prev) => new Set(prev).add(worktreePath));
+        setTimeout(() => {
+          void removeWorktree(parentProjectId, worktreePath);
+        }, 280);
+      },
+    });
   }
 
   function openDrawer(panel: DrawerPanel) {
@@ -4545,6 +4677,16 @@ ${goalTextRef.current}
                   <span className="project-row-actions">
                     <span
                       className="project-action"
+                      title={t("app.projectRefresh")}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void refreshProjectTree(project);
+                      }}
+                    >
+                      <RefreshCw size={14} />
+                    </span>
+                    <span
+                      className="project-action"
                       title={t("app.projectNewAgent")}
                       onClick={(event) => {
                         event.stopPropagation();
@@ -4595,14 +4737,29 @@ ${goalTextRef.current}
                 {!isCollapsed && project.worktreeEnabled && (
                   <div className="worktree-children worktree-main-header-only">
                     <button
-                      className="worktree-workspace-header"
+                      className={`conversation worktree-workspace-header${project.id === activeProjectId && !activeAgentId ? " active" : ""}`}
+                      // 点击主工作区 header 等同于选中父项目本身：激活主项目并加载其会话，
+                      // 避免与点击父项目行产生行为分歧导致用户迷惑。
                       onClick={() => {
                         setActiveProjectId(project.id);
                         setActiveAgentId(undefined);
+                        if (!projectIsChat && !sessionsByProject[project.id]?.length) {
+                          void refreshProjectSessions(project.id).catch(() => undefined);
+                        }
                       }}
+                      title={t("app.worktreeMainWorkspace")}
                     >
-                      <GitBranch size={12} />
-                      <span>{branchByProject[project.id] || "main"}</span>
+                      <span className="worktree-main-branch-icon">
+                        <GitBranch size={12} />
+                      </span>
+                      <div className="conversation-body">
+                        <div className="conversation-title">
+                          <strong>{t("app.worktreeMainWorkspace")}</strong>
+                          <span className="worktree-main-branch">
+                            {branchByProject[project.id] ?? t("app.worktreeBranchLoading")}
+                          </span>
+                        </div>
+                      </div>
                     </button>
                   </div>
                 )}
@@ -4696,12 +4853,6 @@ ${goalTextRef.current}
                           <span className="agent-node-marker" aria-hidden="true" />
                           <div className="conversation-body">
                             <div className="conversation-title">
-                              <strong>{agent.title}</strong>
-                              {child.source && child.source !== "pi" && (
-                                <span className={`session-source-badge ${child.source}`}>
-                                  {t(`sessionSource.${child.source}` as any)}
-                                </span>
-                              )}
                               {agent.status && (
                                 <span className={`agent-status-indicator status-${agent.status}`}>
                                   {agent.status === 'running' && '●'}
@@ -4709,6 +4860,12 @@ ${goalTextRef.current}
                                   {agent.status === 'starting' && '◐'}
                                   {' '}
                                   {t(`app.status${agent.status.charAt(0).toUpperCase() + agent.status.slice(1)}` as any) || agent.status}
+                                </span>
+                              )}
+                              <strong>{agent.title}</strong>
+                              {child.source && child.source !== "pi" && (
+                                <span className={`session-source-badge ${child.source}`}>
+                                  {t(`sessionSource.${child.source}` as any)}
                                 </span>
                               )}
                             </div>
@@ -4743,7 +4900,7 @@ ${goalTextRef.current}
                         />
                         <div className="conversation-body">
                           <div className="conversation-title">
-                            <strong>
+                            <strong title={session.name || t("common.untitled")}>
                               {session.name || t("common.untitled")}
                             </strong>
                             {session.source && session.source !== "pi" && (
@@ -4785,6 +4942,20 @@ ${goalTextRef.current}
                 )}
                 {!isCollapsed && project.worktreeEnabled && (
                   <div className="worktree-children worktree-sandbox-list">
+                    <div className="worktree-sandbox-toolbar">
+                      <span>{t("app.worktreeOtherWorkspaces")}</span>
+                      <button
+                        className="worktree-create-btn"
+                        title={t("app.worktreeNew")}
+                        aria-label={t("app.worktreeNew")}
+                        onClick={() => {
+                          setWorktreeCreateDialog({ projectId: project.id });
+                        }}
+                      >
+                        <GitBranch size={12} />
+                        <span>{t("app.worktreeNewShort")}</span>
+                      </button>
+                    </div>
                     {(() => {
                       // 合并 git worktree 列表和已注册的子项目，确保外部 worktree 也能显示。
                       const wtEntries = worktreesByProject[project.id] ?? [];
@@ -4802,11 +4973,26 @@ ${goalTextRef.current}
                       const childAgents = childProject
                         ? filteredAgents.filter((agent) => agent.projectId === childProject.id)
                         : [];
-                      const childSessions = childProject ? (sessionsByProject[childProject.id] ?? []) : [];
+                      const rawChildSessions = childProject ? (sessionsByProject[childProject.id] ?? []) : [];
+                      // 已经打开成 Agent 的历史会话不再作为 session 行重复展示，避免同一会话出现两条入口。
+                      const childSessions = rawChildSessions.filter(
+                        (session) => !childAgents.some((agent) => isSameSessionPath(agent.sessionPath, session.filePath)),
+                      );
+                      // 默认只展示 3 条会话，展开后显示全部，避免子工作区会话过多时侧栏过长。
+                      const sessionsExpanded = expandedWorktreeSessions.has(wt.path);
+                      const visibleSessions = sessionsExpanded
+                        ? childSessions
+                        : childSessions.slice(0, 3);
+                      const hiddenSessionCount = childSessions.length - visibleSessions.length;
+                      // 取目录名作为副信息，帮助用户区分多个 worktree。
+                      const dirName = wt.path.split(/[/\\]/).filter(Boolean).pop() || wt.path;
+                      // PiDeck 创建的 worktree 分支使用 pideck/{slug} 命名；侧栏只展示 slug，
+                      // 避免同一行同时出现 pideck/test-a 和 test-a 造成信息重复。
+                      const displayBranchName = wt.branch.replace(/^pideck\//, "");
                       return (
                         <Fragment key={wt.path}>
                           <button
-                            className={`conversation worktree-row${isActive ? " active" : ""}`}
+                            className={`conversation worktree-row${isActive ? " active" : ""}${removingWorktreePaths.has(wt.path) ? " worktree-removing" : ""}`}
                             onClick={() => {
                               if (childProject) {
                                 setActiveProjectId(childProject.id);
@@ -4830,13 +5016,29 @@ ${goalTextRef.current}
                             <span className="worktree-branch-icon">
                               <GitBranch size={12} />
                             </span>
-                            <span className="worktree-branch-name">{wt.branch}</span>
+                            <span className="worktree-branch-name">{displayBranchName}</span>
+                            {dirName !== displayBranchName && (
+                              <span className="worktree-dir-meta" title={wt.path}>{dirName}</span>
+                            )}
+                            {childProject && (
+                              // 子工作区直接新建 Agent，免去先选中再从别处创建的绕路操作。
+                              <span
+                                className="project-action worktree-new-agent"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void createAgent(childProject.id);
+                                }}
+                                title={t("app.projectNewAgent")}
+                              >
+                                <Plus size={12} />
+                              </span>
+                            )}
                             {childProject && (
                               <span
                                 className="project-action worktree-remove"
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  void removeWorktree(project.id, wt.path);
+                                  requestRemoveWorktree(project.id, wt.path, childProject);
                                 }}
                                 title={t("menu.removeProject")}
                               >
@@ -4848,6 +5050,19 @@ ${goalTextRef.current}
                             <button
                               key={agent.id}
                               className={agent.id === activeAgentId ? "conversation agent-row worktree-nested-row active" : "conversation agent-row worktree-nested-row"}
+                              onContextMenu={async (event) => {
+                                event.preventDefault();
+                                const logging = await window.piDesktop.rpcLogs.getLogging(agent.id);
+                                setAgentRpcLogging((prev) => {
+                                  const next = new Map(prev);
+                                  next.set(agent.id, logging);
+                                  return next;
+                                });
+                                setAgentMenu({
+                                  ...adjustMenuPos(event.clientX, event.clientY, 200, 260),
+                                  agent,
+                                });
+                              }}
                               onClick={() => {
                                 setActiveProjectId(agent.projectId);
                                 setActiveAgentId(agent.id);
@@ -4855,11 +5070,22 @@ ${goalTextRef.current}
                             >
                               <span className="agent-node-marker" aria-hidden="true" />
                               <div className="conversation-body">
-                                <div className="conversation-title"><strong>{agent.title}</strong></div>
+                                <div className="conversation-title">
+                                  {agent.status && (
+                                    <span className={`agent-status-indicator status-${agent.status}`}>
+                                      {agent.status === 'running' && '●'}
+                                      {agent.status === 'idle' && '○'}
+                                      {agent.status === 'starting' && '◐'}
+                                      {' '}
+                                      {t(`app.status${agent.status.charAt(0).toUpperCase() + agent.status.slice(1)}` as any) || agent.status}
+                                    </span>
+                                  )}
+                                  <strong>{agent.title}</strong>
+                                </div>
                               </div>
                             </button>
                           ))}
-                          {childSessions.slice(0, 3).map((session) => (
+                          {visibleSessions.map((session) => (
                             <button
                               key={session.filePath}
                               className="conversation agent-row session-row worktree-nested-row"
@@ -4868,22 +5094,27 @@ ${goalTextRef.current}
                             >
                               <span className="session-node-marker" aria-hidden="true" />
                               <div className="conversation-body">
-                                <div className="conversation-title"><strong>{session.name || t("common.untitled")}</strong></div>
+                                <div className="conversation-title"><strong title={session.name || t("common.untitled")}>{session.name || t("common.untitled")}</strong></div>
                               </div>
                             </button>
                           ))}
+                          {hiddenSessionCount > 0 && (
+                            <button
+                              className="worktree-sessions-more"
+                              onClick={() => {
+                                setExpandedWorktreeSessions((prev) => {
+                                  const next = new Set(prev);
+                                  next.add(wt.path);
+                                  return next;
+                                });
+                              }}
+                            >
+                              {t("app.worktreeShowMoreSessions", { count: hiddenSessionCount })}
+                            </button>
+                          )}
                         </Fragment>
                       );
                     })}
-                    <button
-                      className="worktree-create-btn"
-                      onClick={() => {
-                        setWorktreeCreateDialog({ projectId: project.id });
-                      }}
-                    >
-                      <Plus size={12} />
-                      <span>{t("app.worktreeNew")}</span>
-                    </button>
                   </div>
                 )}
               </div>
@@ -5333,21 +5564,25 @@ ${goalTextRef.current}
           )}
           {activeAgentId && extensionWidgetsByAgent[activeAgentId] && Object.keys(extensionWidgetsByAgent[activeAgentId]).length > 0 && (() => {
             const entries = Object.entries(extensionWidgetsByAgent[activeAgentId]);
-            const collapsed = widgetsCollapsedByAgent[activeAgentId] ?? false;
+            const widgetSessionKey = getAgentSessionStorageKey(activeAgent, activeAgentId);
             return (
               <div className="extension-widgets-container" key="widgets-container">
-                {!collapsed && entries.filter(([key]) =>
-                  activeAgentId && !(agentDismissedWidgets[activeAgentId]?.includes(key))
+                {!widgetsCollapsed && entries.filter(([key]) =>
+                  widgetSessionKey && !(agentDismissedWidgets[widgetSessionKey]?.includes(key))
                 ).map(([widgetKey, widgetLines]) => (
                   <ExtensionWidgetCard
                     key={widgetKey}
                     widgetKey={widgetKey}
                     lines={widgetLines}
+                    sessionIdOrPath={widgetSessionKey}
                     onClose={() => {
+                      if (!widgetSessionKey) return;
                       setAgentDismissedWidgets((prev) => {
-                        const current = prev[activeAgentId!] ?? [];
+                        const current = prev[widgetSessionKey] ?? [];
                         if (current.includes(widgetKey)) return prev;
-                        return { ...prev, [activeAgentId!]: [...current, widgetKey] };
+                        const next = { ...prev, [widgetSessionKey]: [...current, widgetKey] };
+                        saveDismissedExtensionWidgets(next);
+                        return next;
                       });
                     }}
                   />
@@ -5360,6 +5595,7 @@ ${goalTextRef.current}
             <SessionFileSummary
               files={sessionFileSummaryByAgent[activeAgentId]}
               onDiffFile={diffFilePath}
+              sessionIdOrPath={activeAgent?.sessionPath ?? activeAgentId}
             />
           )}
           <div
@@ -5636,14 +5872,33 @@ ${goalTextRef.current}
               active: editorsOpen,
               label: t("app.openWithEditor"),
               onClick: (e) => {
+                const projectPath =
+                  activeAgent?.cwd ||
+                  (activeProject && !isChatProject(activeProject)
+                    ? activeProject.path
+                    : null);
+                setEditorsTargetPath(projectPath);
                 setEditorsOpen((open) => !open);
                 const btn = (e?.currentTarget as HTMLElement)?.closest("button");
                 if (btn) {
                   const rect = btn.getBoundingClientRect();
-                  setEditorsAnchor({ x: rect.left - 4, y: rect.top });
+                  setEditorsAnchor(adjustMenuPos(rect.left - 4, rect.top, 220, 280));
                 }
               },
               icon: <Code size={17} />,
+            }}
+            browserAction={{
+              active: drawer === "browser",
+              label: t("app.browser"),
+              onClick: () => {
+                if (drawer === "browser" && !drawerCollapsed) {
+                  setDrawer(null);
+                } else {
+                  setDrawer("browser");
+                  setDrawerCollapsed(false);
+                }
+              },
+              icon: <Globe size={17} />,
             }}
           />
         )}
@@ -5664,7 +5919,14 @@ ${goalTextRef.current}
         data-open={drawer && !drawerCollapsed}
         data-rendered={Boolean(drawerContentPanel)}
       >
-        {drawerContentPanel && (
+        {drawerContentPanel === "browser" && !drawerCollapsed && !browserFullscreen ? (
+          <div className="drawer-content-frame">
+            <BrowserPanel
+              onClose={() => setDrawer(null)}
+              onToggleFullscreen={() => setBrowserFullscreen(true)}
+            />
+          </div>
+        ) : drawerContentPanel && drawerContentPanel !== "browser" ? (
           <LazyWrapper
             className="drawer-content-frame"
             enabled={true}
@@ -5730,7 +5992,7 @@ ${goalTextRef.current}
               onOpenFile={openFilePath}
             />
           </LazyWrapper>
-        )}
+        ) : null}
       </aside>
       {drawer && drawerCollapsed && (
         <button
@@ -5845,6 +6107,12 @@ ${goalTextRef.current}
             void api.files.showInFolder(projectMenu.project.path);
             setProjectMenu(null);
           }}
+          onOpenWithEditor={() => {
+            setEditorsTargetPath(projectMenu.project.path);
+            setEditorsAnchor(adjustMenuPos(projectMenu.x, projectMenu.y, 220, 280));
+            setEditorsOpen(true);
+            setProjectMenu(null);
+          }}
           onImportCodexSessions={() => openCodexImport(projectMenu.project)}
           onImportClaudeSessions={() => openClaudeImport(projectMenu.project)}
           onImportOpenCodeSessions={() => openOpenCodeImport(projectMenu.project)}
@@ -5882,7 +6150,13 @@ ${goalTextRef.current}
                 }
               }
             } catch (e) {
-              console.error('Toggle worktree failed', e);
+              // 后端在非 git 项目启用时抛出 NOT_A_GIT_REPO，给用户明确提示而非静默失败。
+              const message = e instanceof Error ? e.message : String(e);
+              if (message.includes("NOT_A_GIT_REPO")) {
+                showToast(t("app.worktreeNotGitRepo"), 5000);
+              } else {
+                console.error('Toggle worktree failed', e);
+              }
             }
           }}
           onRemoveProject={async () => {
@@ -6062,10 +6336,15 @@ ${goalTextRef.current}
       {worktreeCreateDialog && (
         <WorktreeCreateDialog
           projectId={worktreeCreateDialog.projectId}
-          creating={false}
+          creating={worktreeCreating}
           onCreate={async (branchName) => {
-            await createWorktree(worktreeCreateDialog.projectId, branchName);
-            setWorktreeCreateDialog(null);
+            try {
+              await createWorktree(worktreeCreateDialog.projectId, branchName);
+              setWorktreeCreateDialog(null);
+            } catch {
+              // createWorktree 内部已通过 toast 反馈错误，这里只阻止关闭弹框，
+              // 便于用户修改名称后重试。
+            }
           }}
           onClose={() => setWorktreeCreateDialog(null)}
         />
@@ -6429,7 +6708,7 @@ ${goalTextRef.current}
           className="editors-popover"
           style={{
             position: "fixed",
-            right: window.innerWidth - editorsAnchor.x,
+            left: editorsAnchor.x,
             top: editorsAnchor.y,
           }}
           onClick={(e) => e.stopPropagation()}
@@ -6442,11 +6721,7 @@ ${goalTextRef.current}
                 key={editor.id}
                 className="editors-popover-item"
                 onClick={() => {
-                  const projectPath =
-                    activeAgent?.cwd ||
-                    (activeProject && !isChatProject(activeProject)
-                      ? activeProject.path
-                      : undefined);
+                  const projectPath = editorsTargetPath;
                   if (projectPath) {
                     void api.editors.openProject(editor, projectPath).catch((error) => {
                       showToast(
@@ -6459,6 +6734,7 @@ ${goalTextRef.current}
                   }
                   setEditorsOpen(false);
                   setEditorsAnchor(null);
+                  setEditorsTargetPath(null);
                 }}
               >
                 <span className={`editor-logo ${editor.id}`}>
@@ -6472,6 +6748,23 @@ ${goalTextRef.current}
               </button>
             ))
           )}
+        </div>
+      )}
+
+      {/* 浏览器全屏覆盖层 */}
+      {browserFullscreen && (
+        <div className="modal-backdrop" onClick={() => setBrowserFullscreen(false)}>
+          <div className="browser-modal" onClick={(e) => e.stopPropagation()}>
+            <BrowserPanel
+              isFullscreen
+              onClose={() => setBrowserFullscreen(false)}
+              onMinimize={() => {
+                setBrowserFullscreen(false);
+                setDrawer("browser");
+                setDrawerCollapsed(false);
+              }}
+            />
+          </div>
         </div>
       )}
 
