@@ -5,82 +5,95 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v* tag to publish
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 jobs:
-  extract-changelog:
-    name: Extract changelog
+  prepare-release:
+    name: Validate release tag
     runs-on: ubuntu-latest
     outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      target_sha: ${{ steps.release.outputs.target_sha }}
       release_body: ${{ steps.changelog.outputs.body }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - name: Checkout repository
+      - name: Checkout release tag
         uses: actions/checkout@v4
+        with:
+          # The tag must be checked out for both tag-push and manual runs.
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Validate tag and source branch
+        id: release
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v.+ ]]; then
+            echo "Release tag must begin with v: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          TAG_COMMIT="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          if [[ "$TAG_COMMIT" != "$(git rev-parse HEAD)" ]]; then
+            echo "Checked out commit does not match tag $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          git fetch origin frostime:refs/remotes/origin/frostime
+          # Only commits already pushed to frostime can be published from this workflow.
+          if ! git merge-base --is-ancestor "$TAG_COMMIT" origin/frostime; then
+            echo "Tag $RELEASE_TAG does not point to a commit in frostime history" >&2
+            exit 1
+          fi
+
+          VERSION="${RELEASE_TAG#v}"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "target_sha=$TAG_COMMIT" >> "$GITHUB_OUTPUT"
 
       - name: Extract changelog for this version
         id: changelog
         run: |
-          # 从 tag 名提取版本号（去掉 v 前缀）
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           echo "Extracting changelog for v${VERSION}..."
-          
-          # 提取该版本的 changelog 内容（从版本标题到下一个版本标题之间）
-          # 优先使用中文 CHANGELOG
+
           BODY=$(awk -v ver="v${VERSION}" '/^## v[0-9]/{if(found) exit; if($2==ver) found=1; next} found{print}' CHANGELOG.zh-CN.md)
           if [ -z "$BODY" ]; then
             BODY=$(awk -v ver="v${VERSION}" '/^## v[0-9]/{if(found) exit; if($2==ver) found=1; next} found{print}' CHANGELOG.md)
           fi
-          
+
           if [ -z "$BODY" ]; then
             BODY="Release v${VERSION}"
           fi
-          
-          # 使用 EOF 标记输出多行内容
-          echo "body<<EOF" >> $GITHUB_OUTPUT
-          echo "$BODY" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          
+
+          echo "body<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$BODY" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
           echo "--- Changelog preview ---"
           echo "$BODY"
           echo "------------------------"
 
   build-release:
-    name: Build ${{ matrix.name || matrix.platform }} packages
-    needs: extract-changelog
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: windows
-            os: windows-latest
-            command: npm run build && npx electron-builder --win nsis portable zip --publish never
-            electron_mirror: https://npmmirror.com/mirrors/electron/
-            electron_builder_binaries_mirror: https://npmmirror.com/mirrors/electron-builder-binaries/
-          - platform: macos
-            name: macOS x64
-            os: macos-latest
-            command: npm run build && npx electron-builder --mac dmg zip --x64 --publish never
-            electron_mirror: ""
-            electron_builder_binaries_mirror: ""
-          - platform: macos
-            name: macOS arm64
-            os: macos-latest
-            command: npm run build && npx electron-builder --mac dmg zip --arm64 --publish never
-            electron_mirror: ""
-            electron_builder_binaries_mirror: ""
-          - platform: linux
-            os: ubuntu-latest
-            command: npm run build && npx electron-builder --linux AppImage deb tar.gz --publish never
-            electron_mirror: https://npmmirror.com/mirrors/electron/
-            electron_builder_binaries_mirror: https://npmmirror.com/mirrors/electron-builder-binaries/
-
-    runs-on: ${{ matrix.os }}
+    name: Build Windows x64 release
+    needs: prepare-release
+    runs-on: windows-latest
+    env:
+      RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout release tag
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -91,35 +104,34 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Set package version from release tag
+        shell: bash
+        run: |
+          node -e 'const fs = require("fs"); const path = "package.json"; const manifest = JSON.parse(fs.readFileSync(path, "utf8")); manifest.version = process.env.RELEASE_VERSION; fs.writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);'
+
       - name: Generate app icon
         run: npm run make-icon
 
       - name: Build packages
-        run: ${{ matrix.command }}
+        run: npm run build && npx electron-builder --win nsis portable zip --x64 --publish never
         env:
           NODE_OPTIONS: "--max-old-space-size=4096"
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # GitHub Releases occasionally returns 504 for Electron/electron-builder binaries;
-          # use a stable mirror for CI downloads while keeping publishing on GitHub Releases.
-          # macOS DMG packaging needs dmgbuild bundles that can be missing from npmmirror,
-          # so the matrix intentionally leaves Electron/builder mirrors empty for macOS.
-          ELECTRON_MIRROR: ${{ matrix.electron_mirror }}
-          ELECTRON_BUILDER_BINARIES_MIRROR: ${{ matrix.electron_builder_binaries_mirror }}
+          # GitHub Releases occasionally returns 504 for Electron/electron-builder binaries.
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+          ELECTRON_BUILDER_BINARIES_MIRROR: https://npmmirror.com/mirrors/electron-builder-binaries/
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          # 多个 job 并发上传同一个 release；设置 prerelease 和 fail_on_unmatched_files:false
-          # 确保各架构产物都能合并到同一个 Release，不会因文件暂时未生成而失败
-          body: ${{ needs.extract-changelog.outputs.release_body }}
-          fail_on_unmatched_files: false
+          tag_name: ${{ needs.prepare-release.outputs.tag }}
+          target_commitish: ${{ needs.prepare-release.outputs.target_sha }}
+          name: PiDeck ${{ needs.prepare-release.outputs.tag }}
+          prerelease: true
+          body: ${{ needs.prepare-release.outputs.release_body }}
+          fail_on_unmatched_files: true
           files: |
             release/*.exe
-            release/*.msi
             release/*.zip
-            release/*.dmg
-            release/*.AppImage
-            release/*.deb
-            release/*.tar.gz
             release/*.blockmap
-            release/latest*.yml
+            release/latest-win.yml
