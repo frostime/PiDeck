@@ -53,6 +53,8 @@ import {
 	ChevronDown,
 	ChevronLeft,
 	ChevronRight,
+	ChevronsUpDown,
+	ChevronsDownUp,
 	GitBranch,
 	Brain,
 	Eye,
@@ -99,6 +101,7 @@ import type {
 	PetManifest,
 	PiCliUpdateResult,
 	PiCommand,
+	PiInstallExecResult,
 	PiInstallStatus,
 	PiUpdateCheckResult,
 	Project,
@@ -108,7 +111,7 @@ import { parseRichInputChips, type RichInputChip } from "./RichInput";
 /** 复用 petdex 标准网格规格，在主设置面板里为宠物选择器渲染单格动画预览 */
 import { GRID_COLS, CELL_W, CELL_H, MODE_ROW, MODE_FRAMES } from "../../pet/PetSpriteSheet";
 
-export type DrawerPanel = "files" | "sessions" | "browser";
+export type DrawerPanel = "files" | "sessions" | "browser" | "editor";
 
 export type SessionModifiedFile = {
 	path: string;
@@ -146,6 +149,25 @@ export function EnvironmentDialog(props: {
 	customPathResult: PiInstallStatus | null;
 	onCustomPathChange: (path: string) => void;
 	onValidateCustomPath: () => void;
+	/** npm 可用性 */
+	npmAvailable: boolean | null;
+	npmVersion?: string;
+	npmChecking: boolean;
+	/** 当前安装命令文本 */
+	installCommand: string;
+	/** 是否使用国内镜像源 */
+	installUseMirror: boolean;
+	/** 是否正在执行安装 */
+	installExecuting: boolean;
+	/** 安装执行结果 */
+	installResult: PiInstallExecResult | null;
+	/** 安装是否已成功完成 */
+	installCompleted: boolean;
+	onCheckNpm: () => void;
+	onInstallCommandChange: (cmd: string) => void;
+	onToggleInstallMirror: () => void;
+	onExecInstall: () => void;
+	onRestartApp: () => void;
 }) {
 	const installed = props.status?.installed || props.customPathResult?.installed;
 	const searchedDirs = props.status?.searchedDirs.slice(0, 16) ?? [];
@@ -225,6 +247,140 @@ export function EnvironmentDialog(props: {
 									<pre className="env-error-pre">{errorText}</pre>
 								</div>
 							)}
+
+							{/* npm 安装 pi 卡片 */}
+							<div className="env-card env-npm-install-card">
+								<strong>{t("environment.installCardTitle")}</strong>
+								<small>{t("environment.installCardDesc")}</small>
+
+								{/* npm 可用性检测 */}
+								{props.npmAvailable === null && !props.npmChecking && (
+									<button
+										className="env-card-btn"
+										onClick={props.onCheckNpm}
+									>
+										{t("environment.stepCli")}
+									</button>
+								)}
+
+								{props.npmChecking && (
+									<div className="env-install-loading">
+										<div className="loader" />
+										<span>{t("environment.checking")}</span>
+									</div>
+								)}
+
+								{/* npm 可用时：显示安装命令和操作 */}
+								{props.npmAvailable === true && !props.npmChecking && (
+									<div className="env-install-area">
+										{props.npmVersion && (
+											<div className="env-install-npm-version">
+												npm {props.npmVersion}
+											</div>
+										)}
+										<div className="env-install-command-row">
+											<label className="env-install-command-label">
+												{t("environment.installCommandLabel")}
+											</label>
+											<input
+												type="text"
+												className="env-install-command-input"
+												value={props.installCommand}
+												onChange={(e) =>
+													props.onInstallCommandChange(e.target.value)
+												}
+												disabled={props.installExecuting}
+												placeholder="npm install -g @earendil-works/pi-coding-agent"
+											/>
+										</div>
+										<div className="env-install-actions">
+											<button
+												className={`env-card-btn env-mirror-btn ${props.installUseMirror ? "active" : ""}`}
+												onClick={props.onToggleInstallMirror}
+												disabled={props.installExecuting}
+												title={t("environment.installUseMirror")}
+											>
+												{props.installUseMirror
+													? t("environment.installRemoveMirror")
+													: t("environment.installUseMirror")}
+											</button>
+											<button
+												className="env-card-btn primary"
+												onClick={props.onExecInstall}
+												disabled={props.installExecuting || !props.installCommand.trim()}
+											>
+												{props.installExecuting
+													? t("environment.installExecuting")
+													: t("environment.installExec")}
+											</button>
+										</div>
+
+										{/* 安装进行中：显示进度 */}
+										{props.installExecuting && (
+											<div className="env-install-progress">
+												<div className="loader" />
+												<span>{t("environment.installExecuting")}</span>
+											</div>
+										)}
+
+										{/* 安装完成 */}
+										{props.installCompleted && (
+											<div className="env-install-success">
+												<div className="env-success-icon">✓</div>
+												<div className="env-success-info">
+													<strong>{t("environment.installSuccess")}</strong>
+													<small>{t("environment.installRestartHint")}</small>
+												</div>
+												<button
+													className="env-card-btn primary"
+													onClick={props.onRestartApp}
+												>
+													{t("environment.restartApp")}
+												</button>
+											</div>
+										)}
+
+										{/* 安装结果输出 */}
+										{props.installResult && (
+											<div className={`env-install-result ${props.installResult.success ? "success" : "error"}`}>
+												<strong>
+													{props.installResult.success
+														? t("environment.installCompleted")
+														: t("environment.installFailed")}
+													{t("environment.installExitCode")}：{props.installResult.exitCode}
+												</strong>
+												{props.installResult.stdout && (
+													<>
+														<span>{t("environment.installOutput")}</span>
+														<pre className="env-install-output-pre">{props.installResult.stdout}</pre>
+													</>
+												)}
+												{props.installResult.stderr && (
+													<pre className="env-install-output-pre env-install-stderr">{props.installResult.stderr}</pre>
+												)}
+											</div>
+										)}
+									</div>
+								)}
+
+								{/* npm 不可用：引导安装 Node.js */}
+								{props.npmAvailable === false && !props.npmChecking && (
+									<div className="env-install-npm-missing">
+										<strong>{t("environment.npmNotFoundTitle")}</strong>
+										<small>{t("environment.npmNotFoundDesc")}</small>
+										<button
+											className="env-card-btn"
+											onClick={() =>
+												window.piDesktop.app.openExternal(
+													"https://nodejs.org/zh-cn/download/"
+												)
+											}
+										>
+											{t("environment.openNodejsOrg")}
+										</button>
+									</div>
+								)}
+							</div>
 
 							{/* 安装指引卡片 */}
 							<div className="env-card env-guide-card">
@@ -668,33 +824,51 @@ export function ModelPicker(props: {
 					</IconButton>
 				</div>
 				<div className="picker-palette-search">
-					<input
-						autoFocus
-						value={modelPickerSearch}
-						onChange={(event) => setModelPickerSearch(event.target.value)}
-						placeholder={t("app.modelPickerSearch")}
-					/>
-					{providerGroupKeys.length > 0 && (
-						<button
-							type="button"
-							className="picker-palette-link"
-							onClick={() => {
-								// 一键折叠/展开当前结果里的所有 provider 分组，避免模型太多时需要逐个点开或收起。
-								setCollapsedGroups((prev) => {
-									if (allProviderGroupsCollapsed) {
-										const next = new Set(prev);
-										for (const groupKey of providerGroupKeys) next.delete(groupKey);
-										return next;
-									}
-									const next = new Set(prev);
-									for (const groupKey of providerGroupKeys) next.add(groupKey);
-									return next;
-								});
-							}}
-						>
-							{allProviderGroupsCollapsed ? t("app.modelExpandAllProviders") : t("app.modelCollapseAllProviders")}
-						</button>
-					)}
+					<div className="picker-palette-search-row">
+						<input
+							autoFocus
+							value={modelPickerSearch}
+							onChange={(event) => setModelPickerSearch(event.target.value)}
+							placeholder={t("app.modelPickerSearch")}
+							className={providerGroupKeys.length > 0 ? "has-actions" : undefined}
+						/>
+						{providerGroupKeys.length > 0 && (
+							<div className="picker-palette-actions">
+								<IconButton
+									className="picker-palette-action-icon"
+									label={t("app.modelCollapseAllProviders")}
+									title={t("app.modelCollapseAllProviders")}
+									onClick={() => {
+										// 一键折叠当前结果里的所有 provider 分组，适合像 IDE 一样快速收拢长列表。
+										setCollapsedGroups((prev) => {
+											const next = new Set(prev);
+											for (const groupKey of providerGroupKeys) next.add(groupKey);
+											return next;
+										});
+									}}
+									disabled={allProviderGroupsCollapsed}
+								>
+									<ChevronsDownUp size={13} strokeWidth={2} aria-hidden="true" />
+								</IconButton>
+								<IconButton
+									className="picker-palette-action-icon"
+									label={t("app.modelExpandAllProviders")}
+									title={t("app.modelExpandAllProviders")}
+									onClick={() => {
+										// 展开当前结果里的所有 provider 分组，避免用户折叠后还要逐个恢复。
+										setCollapsedGroups((prev) => {
+											const next = new Set(prev);
+											for (const groupKey of providerGroupKeys) next.delete(groupKey);
+											return next;
+										});
+									}}
+									disabled={!allProviderGroupsCollapsed}
+								>
+									<ChevronsUpDown size={13} strokeWidth={2} aria-hidden="true" />
+								</IconButton>
+							</div>
+						)}
+					</div>
 				</div>
 				<div className="picker-palette-list">
 					{/* 收藏分区：置于最顶部，可折叠 */}
@@ -2244,7 +2418,34 @@ export const TurnRow = memo(function TurnRow(props: {
 		.filter(Boolean)
 		.join("\n\n");
 
+	/** 找出 message 在 run.items 中的位置，分离「执行过程」（最后一条 assistant message 之前的所有条目）。
+	 *  执行过程包含 thinking-group、tool-group 以及中间穿插的 assistant 消息，
+	 *  默认折叠并以概要形式展示，用户可展开查看细节。最后一条 assistant 消息作为最终回答始终可见。 */
+	const lastAssistantIndex = (() => {
+		for (let i = run.items.length - 1; i >= 0; i--) {
+			if (run.items[i].kind === "message" && (run.items[i] as MessageItem).message.role === "assistant") {
+				return i;
+			}
+		}
+		return -1;
+	})();
+	const hasExecutionProcess = lastAssistantIndex > 0;
+	const executionItems = hasExecutionProcess ? (run.items as (ThinkingGroupItem | ToolGroupItem | MessageItem)[]).slice(0, lastAssistantIndex) : [];
+	const finalMessageItem = lastAssistantIndex >= 0 ? (run.items[lastAssistantIndex] as MessageItem) : null;
 
+	const toolCount = executionItems.filter((i) => i.kind === "tool-group").length;
+	const thinkingCount = executionItems.filter((i) => i.kind === "thinking-group").length;
+	const interReplyCount = executionItems.filter(
+		(i) => i.kind === "message" && i.message.role === "assistant",
+	).length;
+
+	const [executionExpanded, setExecutionExpanded] = useState(!isComplete);
+	// 输出完毕后自动折叠执行过程
+	useEffect(() => {
+		if (isComplete && !props.isStreaming) {
+			setExecutionExpanded(false);
+		}
+	}, [isComplete, props.isStreaming]);
 
 	const rowRef = useRef<HTMLElement | null>(null);
 	// 本轮没有任何可渲染内容时不输出空容器
@@ -2254,6 +2455,88 @@ export const TurnRow = memo(function TurnRow(props: {
 		run.items.some(item => item.kind === "tool-group") ||
 		allImages.length > 0;
 	if (!hasContent) return null;
+
+	/** 渲染执行过程中的一个条目（thinking-group / tool-group / assistant message）。 */
+	const renderExecutionItem = (item: ThinkingGroupItem | ToolGroupItem | MessageItem) => {
+		if (item.kind === "thinking-group") {
+			if (!props.showThinking) return null;
+			return (
+				<ThinkingBlock
+					key={item.id}
+					text={item.text}
+					startedAt={item.startedAt}
+					endedAt={item.endedAt}
+					showThinking={props.showThinking}
+				/>
+			);
+		}
+		if (item.kind === "tool-group") {
+			return <ToolGroupCard key={item.id} group={item} onDiffFile={props.onDiffFile} />;
+		}
+		if (item.kind === "message" && item.message.role === "assistant") {
+			const txt = stripThinkingTags(stripAnsi(item.message.text)).trim();
+			if (!txt) return null;
+			return (
+				<AssistantText
+					key={item.message.id}
+					text={txt}
+					images={allImages}
+					onPreviewImage={props.onPreviewImage}
+					onOpenExternal={props.onOpenExternal}
+					onOpenFile={props.onOpenFile}
+					isStreaming={props.isStreaming ?? false}
+				/>
+			);
+		}
+		return null;
+	};
+
+	const finalTxt = finalMessageItem
+		? stripThinkingTags(stripAnsi(finalMessageItem.message.text)).trim()
+		: "";
+	const finalThinking = finalMessageItem?.message.thinking?.trim()
+		? stripAnsi(finalMessageItem.message.thinking)
+		: null;
+	const hasFinalThinking = Boolean(finalThinking && props.showThinking);
+
+	// 统计：把最终回答的思考也计入执行过程
+	const totalThinkingCount = thinkingCount + (hasFinalThinking ? 1 : 0);
+	/** 将统计拼成概要文本。 */
+	const summaryParts: string[] = [];
+	if (toolCount > 0) summaryParts.push(`${toolCount}个工具`);
+	if (totalThinkingCount > 0) summaryParts.push(`${totalThinkingCount}次思考`);
+	if (interReplyCount > 0) summaryParts.push(`${interReplyCount}次回答`);
+	const summaryText = summaryParts.length > 0 ? `执行过程: ${summaryParts.join(" ")}` : "";
+
+	// 是否有任何需要折叠的内容（非最终回答条目 + 最终回答的思考）
+	const hasFoldableContent = lastAssistantIndex > 0 || hasFinalThinking;
+
+	// 没有助手指令消息的情况：整轮只含工具/思考，直接扁平渲染
+	if (lastAssistantIndex === -1) {
+		return (
+			<article ref={rowRef} className="turn-row" data-message-id={run.id}>
+				<div className="turn-row-body">
+					<div className="turn-row-meta">
+						<span className="turn-row-agent">pi</span>
+						<time>{formatTime(run.endedAt)}</time>
+						{showDuration && (
+							<span className="turn-row-duration">{formatDuration(duration)}</span>
+						)}
+					</div>
+					{run.items.map((item) => {
+						if (item.kind === "thinking-group") {
+							if (!props.showThinking) return null;
+							return <ThinkingBlock key={item.id} text={item.text} startedAt={item.startedAt} endedAt={item.endedAt} showThinking={props.showThinking} />;
+						}
+						if (item.kind === "tool-group") {
+							return <ToolGroupCard key={item.id} group={item} onDiffFile={props.onDiffFile} />;
+						}
+						return null;
+					})}
+				</div>
+			</article>
+		);
+	}
 
 	return (
 		<article ref={rowRef} className="turn-row" data-message-id={run.id}>
@@ -2265,127 +2548,124 @@ export const TurnRow = memo(function TurnRow(props: {
 						<span className="turn-row-duration">{formatDuration(duration)}</span>
 					)}
 				</div>
-				<>
-					{/* 按时序渲染思考 / 工具调用 / 助理回复 */}
-					{run.items.map((item) => {
-						if (item.kind === "thinking-group") {
-							if (!props.showThinking) return null;
-							return (
-								<ThinkingBlock
-									key={item.id}
-									text={item.text}
-									startedAt={item.startedAt}
-									endedAt={item.endedAt}
-									showThinking={props.showThinking}
-								/>
-							);
-						}
-						if (item.kind === "tool-group") {
-							return <ToolGroupCard key={item.id} group={item} onDiffFile={props.onDiffFile} />;
-						}
-						if (item.kind === "message" && item.message.role === "assistant") {
-							const txt = stripThinkingTags(stripAnsi(item.message.text)).trim();
-							const thinking = item.message.thinking?.trim()
-								? stripAnsi(item.message.thinking)
-								: null;
-							if (!txt && !thinking) return null;
-							return (
-								<Fragment key={item.message.id}>
-									{props.showThinking && thinking && (
-										<ThinkingBlock
-											text={thinking}
-											startedAt={run.startedAt}
-											endedAt={item.message.timestamp > run.startedAt ? item.message.timestamp : run.endedAt}
-											showThinking={props.showThinking}
-										/>
-									)}
-									{editing ? (
-										<div className="turn-row-edit-area" ref={editAreaRef}>
-											<div className="edit-area-indicator">{t("common.edit")}</div>
-											<textarea
-												className="turn-row-edit-textarea"
-												value={editText}
-												onChange={(e) => setEditText(e.target.value)}
-												onKeyDown={(e) => {
-													if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-														e.preventDefault();
-														const targetId = assistantMessages.at(-1)?.message.id;
-														if (targetId && props.onEditMessage) {
-															props.onEditMessage(targetId, editText);
-															setEditing(false);
-														}
-													}
-													if (e.key === "Escape") setEditing(false);
-												}}
-												autoFocus
-											/>
-											<div className="turn-row-edit-actions">
-												<button className="turn-row-edit-btn primary" onClick={() => {
-													const targetId = assistantMessages.at(-1)?.message.id;
-													if (targetId && props.onEditMessage) {
-														props.onEditMessage(targetId, editText);
-														setEditing(false);
-													}
-												}}>{t("common.save")}</button>
-												<button className="turn-row-edit-btn" onClick={() => setEditing(false)}>{t("common.cancel")}</button>
-											</div>
-										</div>
-									) : txt ? (
-										<AssistantText
-											text={txt}
-											images={allImages}
-											onPreviewImage={props.onPreviewImage}
-											onOpenExternal={props.onOpenExternal}
-											onOpenFile={props.onOpenFile}
-											isStreaming={props.isStreaming ?? false}
-										/>
-									) : null}
-								</Fragment>
-							);
-						}
-						return null;
-					})}
-					{/* 操作栏 */}
-					{mergedText && !editing && (
-							<div className="turn-row-actions">
-								<CopyMenu text={mergedText} markdown={mergedText} targetRef={rowRef} />
-								<button
-									className="turn-row-action-btn"
-									onClick={props.onEnterMultiSelect}
-									title={t("app.multiSelectEnter")}
-								>
-									{t("app.multiSelectEnter")}
-								</button>
-								{!props.isStreaming && !props.agentRunning && assistantMessages.at(-1)?.message.id && (
-									<>
-										<button
-											className="turn-row-action-btn"
-											onClick={() => {
-												setEditText(mergedText);
-												setEditing(true);
-											}}
-											title={t("common.edit")}
-										>
-											{t("common.edit")}
-										</button>
-										<button
-											className="turn-row-action-btn"
-											onClick={() => {
-												const targetId = assistantMessages.at(-1)?.message.id;
-												if (targetId && props.onDeleteMessage) {
-													props.onDeleteMessage(targetId);
-												}
-											}}
-											title={t("common.delete")}
-										>
-											{t("common.delete")}
-										</button>
-									</>
+				{/* 执行过程概要（含工具/思考/中间回答），默认折叠 */}
+				{hasFoldableContent && summaryText && (
+					<div className="execution-summary">
+						<button
+							type="button"
+							className="execution-summary-toggle"
+							onClick={() => setExecutionExpanded((prev) => !prev)}
+							aria-expanded={executionExpanded}
+							title={executionExpanded ? t("common.collapse") : t("common.expand")}
+						>
+							{executionExpanded ? (
+								<ChevronDown size={14} aria-hidden="true" />
+							) : (
+								<ChevronRight size={14} aria-hidden="true" />
+							)}
+							<span>{summaryText}</span>
+						</button>
+						{executionExpanded && (
+							<div className="execution-summary-details">
+								{executionItems.map(renderExecutionItem)}
+								{/* 最终回答的思考也纳入折叠区 */}
+								{hasFinalThinking && (
+									<ThinkingBlock
+										text={finalThinking!}
+										startedAt={run.startedAt}
+										endedAt={finalMessageItem!.message.timestamp > run.startedAt ? finalMessageItem!.message.timestamp : run.endedAt}
+										showThinking={props.showThinking}
+									/>
 								)}
 							</div>
 						)}
-
-					</>
+					</div>
+				)}
+				{/* 最终回答（始终可见）；其中的思考已归入执行过程折叠区 */}
+				{finalMessageItem && (
+					<Fragment key={finalMessageItem.message.id}>
+						{editing ? (
+							<div className="turn-row-edit-area" ref={editAreaRef}>
+								<div className="edit-area-indicator">{t("common.edit")}</div>
+								<textarea
+									className="turn-row-edit-textarea"
+									value={editText}
+									onChange={(e) => setEditText(e.target.value)}
+									onKeyDown={(e) => {
+										if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+											e.preventDefault();
+											const targetId = assistantMessages.at(-1)?.message.id;
+											if (targetId && props.onEditMessage) {
+												props.onEditMessage(targetId, editText);
+												setEditing(false);
+											}
+										}
+										if (e.key === "Escape") setEditing(false);
+									}}
+									autoFocus
+								/>
+								<div className="turn-row-edit-actions">
+									<button className="turn-row-edit-btn primary" onClick={() => {
+										const targetId = assistantMessages.at(-1)?.message.id;
+										if (targetId && props.onEditMessage) {
+											props.onEditMessage(targetId, editText);
+											setEditing(false);
+										}
+									}}>{t("common.save")}</button>
+									<button className="turn-row-edit-btn" onClick={() => setEditing(false)}>{t("common.cancel")}</button>
+								</div>
+							</div>
+						) : finalTxt ? (
+							<AssistantText
+								text={finalTxt}
+								images={allImages}
+								onPreviewImage={props.onPreviewImage}
+								onOpenExternal={props.onOpenExternal}
+								onOpenFile={props.onOpenFile}
+								isStreaming={props.isStreaming ?? false}
+							/>
+						) : null}
+					</Fragment>
+				)}
+				{/* 操作栏 */}
+				{mergedText && !editing && (
+					<div className="turn-row-actions">
+						<CopyMenu text={mergedText} markdown={mergedText} targetRef={rowRef} />
+						<button
+							className="turn-row-action-btn"
+							onClick={props.onEnterMultiSelect}
+							title={t("app.multiSelectEnter")}
+						>
+							{t("app.multiSelectEnter")}
+						</button>
+						{!props.isStreaming && !props.agentRunning && assistantMessages.at(-1)?.message.id && (
+							<>
+								<button
+									className="turn-row-action-btn"
+									onClick={() => {
+										setEditText(mergedText);
+										setEditing(true);
+									}}
+									title={t("common.edit")}
+								>
+									{t("common.edit")}
+								</button>
+								<button
+									className="turn-row-action-btn"
+									onClick={() => {
+										const targetId = assistantMessages.at(-1)?.message.id;
+										if (targetId && props.onDeleteMessage) {
+											props.onDeleteMessage(targetId);
+										}
+									}}
+									title={t("common.delete")}
+								>
+									{t("common.delete")}
+								</button>
+							</>
+						)}
+					</div>
+				)}
 			</div>
 		</article>
 	);

@@ -8,33 +8,20 @@ import {
 	PawPrint,
 	Trash2,
 	RefreshCw,
+	Minus,
+	Plus,
 } from "lucide-react";
 import { t } from "../../i18n";
 import { Button } from "../ui/Button";
-import { CloseIconButton } from "../ui/IconButton";
+import { CloseIconButton, IconButton } from "../ui/IconButton";
 import { SelectField } from "../ui/SelectField";
 import { TextField } from "../ui/TextField";
 import type { AppSettings, AppInfo, PiInstallStatus, PiUpdateCheckResult, PiCliUpdateResult, PetManifest } from "../../../shared/types";
 import { GRID_COLS, CELL_W, CELL_H, MODE_ROW, MODE_FRAMES } from "../../pet/PetSpriteSheet";
 
-const fontSizeOptions = [
-	{ value: "compact", label: t("settings.fontSizeCompact") },
-	{ value: "default", label: t("settings.fontSizeDefault") },
-	{ value: "medium", label: t("settings.fontSizeMedium") },
-	{ value: "large", label: t("settings.fontSizeLarge") },
-	{ value: "xlarge", label: t("settings.fontSizeXlarge") },
-];
-const fontBaseOptions = [
-	{ value: "system", label: t("settings.fontFamilyBaseSystem") },
-	{ value: "sans", label: t("settings.fontFamilyBaseSans") },
-	{ value: "serif", label: t("settings.fontFamilyBaseSerif") },
-	{ value: "custom", label: t("settings.fontCustomOption") },
-];
-const fontMonoOptions = [
-	{ value: "commit-mono", label: t("settings.fontFamilyMonoCommitMono") },
-	{ value: "system-mono", label: t("settings.fontFamilyMonoSystemMono") },
-	{ value: "custom", label: t("settings.fontCustomOption") },
-];
+const ZOOM_FACTOR_MIN = 0.8;
+const ZOOM_FACTOR_MAX = 1.5;
+const ZOOM_FACTOR_STEP = 0.05;
 
 type SettingsTabId = "base" | "proxy" | "web" | "dev" | "pet" | "storage";
 
@@ -110,8 +97,41 @@ export function SettingsModal(props: {
 	onChange: (patch: Partial<AppSettings>) => void;
 }) {
 	const [activeTab, setActiveTab] = useState<SettingsTabId>("base");
+	const [perAreaFontSize, setPerAreaFontSize] = useState(
+		props.settings.uiFontSize !== null ||
+			props.settings.chatFontSize !== null ||
+			props.settings.inputFontSize !== null,
+	);
 	const [webPortDraft, setWebPortDraft] = useState(String(props.settings.webServicePort));
 	const piPath = props.settings.customPiPath || props.piStatus?.command || "";
+	const changeZoomFactor = (delta: number) => {
+		const next = Math.min(
+			ZOOM_FACTOR_MAX,
+			Math.max(
+				ZOOM_FACTOR_MIN,
+				Math.round((props.settings.zoomFactor + delta) * 100) / 100,
+			),
+		);
+		props.onChange({ zoomFactor: next });
+	};
+	const fontSizeOptions = [
+		{ value: "compact", label: t("settings.fontSizeCompact") },
+		{ value: "default", label: t("settings.fontSizeDefault") },
+		{ value: "medium", label: t("settings.fontSizeMedium") },
+		{ value: "large", label: t("settings.fontSizeLarge") },
+		{ value: "xlarge", label: t("settings.fontSizeXlarge") },
+	];
+	const fontBaseOptions = [
+		{ value: "system", label: t("settings.fontFamilyBaseSystem") },
+		{ value: "sans", label: t("settings.fontFamilyBaseSans") },
+		{ value: "serif", label: t("settings.fontFamilyBaseSerif") },
+		{ value: "custom", label: t("settings.fontCustomOption") },
+	];
+	const fontMonoOptions = [
+		{ value: "commit-mono", label: t("settings.fontFamilyMonoCommitMono") },
+		{ value: "system-mono", label: t("settings.fontFamilyMonoSystemMono") },
+		{ value: "custom", label: t("settings.fontCustomOption") },
+	];
 	useEffect(() => {
 		setWebPortDraft(String(props.settings.webServicePort));
 	}, [props.settings.webServicePort]);
@@ -280,6 +300,46 @@ export function SettingsModal(props: {
 											})
 										}
 									/>
+									<SettingSwitch
+										title={t("settings.nativeTitleBar")}
+										checked={props.settings.useNativeTitleBar}
+										onChange={(checked) =>
+											props.onChange({ useNativeTitleBar: checked })
+										}
+									/>
+									<SettingSwitch
+										title={t("settings.nativeMenu")}
+										checked={props.settings.showNativeMenu}
+										onChange={(checked) =>
+											props.onChange({ showNativeMenu: checked })
+										}
+									/>
+									<div className="setting-field setting-zoom-field">
+										<span>{t("settings.zoomFactor")}</span>
+										<div className="setting-zoom-control">
+											<IconButton
+												className="icon-button setting-zoom-button"
+												label={t("settings.zoomOut")}
+												disabled={props.settings.zoomFactor <= ZOOM_FACTOR_MIN}
+												onClick={() => changeZoomFactor(-ZOOM_FACTOR_STEP)}
+											>
+												<Minus size={16} strokeWidth={2.2} aria-hidden="true" />
+											</IconButton>
+											<output className="setting-zoom-value" aria-live="polite">
+												{Math.round(props.settings.zoomFactor * 100)}%
+											</output>
+											<IconButton
+												className="icon-button setting-zoom-button"
+												label={t("settings.zoomIn")}
+												disabled={props.settings.zoomFactor >= ZOOM_FACTOR_MAX}
+												onClick={() => changeZoomFactor(ZOOM_FACTOR_STEP)}
+											>
+												<Plus size={16} strokeWidth={2.2} aria-hidden="true" />
+											</IconButton>
+										</div>
+									</div>
+								</SettingsSection>
+								<SettingsSection title={t("settings.typography")}>
 									<SelectField
 										className="setting-field"
 										label={t("settings.fontSize")}
@@ -291,6 +351,59 @@ export function SettingsModal(props: {
 											})
 										}
 									/>
+									<SettingSwitch
+										title={t("settings.fontSizePerArea")}
+										description={t("settings.fontSizePerAreaDesc")}
+										checked={perAreaFontSize}
+										onChange={(checked) => {
+											setPerAreaFontSize(checked);
+											if (!checked) {
+												props.onChange({
+													uiFontSize: null,
+													chatFontSize: null,
+													inputFontSize: null,
+												});
+											}
+										}}
+									/>
+									{perAreaFontSize && (
+										<>
+											<SelectField
+												className="setting-field"
+												label={t("settings.uiFontSize")}
+												value={props.settings.uiFontSize ?? props.settings.fontSize}
+												options={fontSizeOptions}
+												onChange={(value) =>
+													props.onChange({
+														uiFontSize: value as AppSettings["uiFontSize"],
+													})
+												}
+											/>
+											<SelectField
+												className="setting-field"
+												label={t("settings.chatFontSize")}
+												value={props.settings.chatFontSize ?? props.settings.fontSize}
+												options={fontSizeOptions}
+												onChange={(value) =>
+													props.onChange({
+														chatFontSize: value as AppSettings["chatFontSize"],
+													})
+												}
+											/>
+											<SelectField
+												className="setting-field"
+												label={t("settings.inputFontSize")}
+												value={props.settings.inputFontSize ?? props.settings.fontSize}
+												options={fontSizeOptions}
+												onChange={(value) =>
+													props.onChange({
+														inputFontSize: value as AppSettings["inputFontSize"],
+													})
+												}
+											/>
+										</>
+									)}
+									<hr className="setting-divider" />
 									<SelectField
 										className="setting-field"
 										label={t("settings.fontFamilyBase")}
@@ -314,6 +427,7 @@ export function SettingsModal(props: {
 											}
 										/>
 									)}
+									<hr className="setting-divider" />
 									<SelectField
 										className="setting-field"
 										label={t("settings.fontFamilyMono")}
@@ -329,7 +443,7 @@ export function SettingsModal(props: {
 									{props.settings.fontFamilyMono === "custom" && (
 										<TextField
 											className="setting-field"
-											label={t("settings.fontFamilyMonoCustom")}
+											label={t("settings.fontFamilyMonoCustomField")}
 											value={props.settings.fontFamilyMonoCustom}
 											placeholder={t("settings.fontFamilyMonoCustomPlaceholder")}
 											onChange={(value) =>
@@ -337,20 +451,6 @@ export function SettingsModal(props: {
 											}
 										/>
 									)}
-									<SettingSwitch
-										title={t("settings.nativeTitleBar")}
-										checked={props.settings.useNativeTitleBar}
-										onChange={(checked) =>
-											props.onChange({ useNativeTitleBar: checked })
-										}
-									/>
-									<SettingSwitch
-										title={t("settings.nativeMenu")}
-										checked={props.settings.showNativeMenu}
-										onChange={(checked) =>
-											props.onChange({ showNativeMenu: checked })
-										}
-									/>
 								</SettingsSection>
 								<SettingsSection title={t("settings.contentMaxWidth")} description={t("settings.contentMaxWidthDesc")}>
 									<div style={{ display: "flex", alignItems: "center", gap: "var(--space-3)", maxWidth: 480 }}>

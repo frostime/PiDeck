@@ -70,10 +70,6 @@ import { useMessagePagination } from "./hooks/useMessagePagination";
 import { useSessionLoader } from "./hooks/useSessionLoader";
 import { useScratchPad } from "./hooks/useScratchPad";
 import { ScratchPadPanel } from "./components/scratchPad/ScratchPadPanel";
-import {
-  resolveFontBaseStack,
-  resolveFontMonoStack,
-} from "./fontSettings";
 import { LazyWrapper } from "./hooks/useLazyComponent";
 import {
   AgentContextMenu,
@@ -166,6 +162,8 @@ import type {
   ImageContent,
   PiCommand,
   PiInstallStatus,
+  PiInstallExecResult,
+  NpmAvailabilityResult,
   PiUpdateCheckResult,
   Project,
   SessionSummary,
@@ -754,6 +752,19 @@ export function App() {
   const [diffViewMode, setDiffViewMode] = useState<"view" | "diff">("view");
   const [diffViewOriginalContent, setDiffViewOriginalContent] = useState<string>("");
   const [diffViewModifiedContent, setDiffViewModifiedContent] = useState<string | undefined>(undefined);
+  /** 编辑器展示模式：弹框或侧栏 */
+  const [editorMode, setEditorMode] = useState<"modal" | "drawer">("drawer");
+  const toggleEditorMode = useCallback(() => {
+    setEditorMode((prev) => {
+      const next = prev === "modal" ? "drawer" : "modal";
+      if (next === "drawer") {
+        // 切到侧栏时确保 drawer 打开
+        setDrawer("editor");
+        setDrawerCollapsed(false);
+      }
+      return next;
+    });
+  }, []);
   const [codexImportProject, setCodexImportProject] = useState<Project | null>(
     null,
   );
@@ -868,6 +879,10 @@ export function App() {
 
     // 字体配置：与 main SettingsStore 默认值保持一致，避免启动时闪烁
     fontSize: "default",
+    uiFontSize: null,
+    chatFontSize: null,
+    inputFontSize: null,
+    zoomFactor: 1,
     fontFamilyBase: "system",
     fontFamilyBaseCustom: "",
     fontFamilyMono: "commit-mono",
@@ -893,6 +908,22 @@ export function App() {
   const [customPathValidating, setCustomPathValidating] = useState(false);
   const [customPathResult, setCustomPathResult] =
     useState<PiInstallStatus | null>(null);
+  /** npm 可用性检测 */
+  const [npmAvailable, setNpmAvailable] = useState<boolean | null>(null);
+  const [npmVersion, setNpmVersion] = useState<string | undefined>(undefined);
+  const [npmChecking, setNpmChecking] = useState(false);
+  /** 安装命令文本（可编辑） */
+  const [installCommand, setInstallCommand] = useState(
+    "npm install -g @earendil-works/pi-coding-agent",
+  );
+  /** 是否使用国内镜像源 */
+  const [installUseMirror, setInstallUseMirror] = useState(false);
+  /** 是否正在执行安装 */
+  const [installExecuting, setInstallExecuting] = useState(false);
+  /** 安装执行结果 */
+  const [installResult, setInstallResult] = useState<PiInstallExecResult | null>(null);
+  /** 安装是否已成功完成 */
+  const [installCompleted, setInstallCompleted] = useState(false);
   const [environmentDialog, setEnvironmentDialog] = useState(false);
   const DEFAULT_LIST_WIDTH = 190;
   const [listWidth, setListWidth] = useState(DEFAULT_LIST_WIDTH);
@@ -1121,7 +1152,6 @@ export function App() {
     return undefined;
   }, [activeMessages]);
 
-
   const isAwaitingAssistant = Boolean(
     activeAgent &&
     !cancellingUi &&
@@ -1232,20 +1262,38 @@ export function App() {
     return () => media.removeEventListener?.("change", applyTheme);
   }, [settings.theme, settings.lightBackground]);
 
-  // 字体配置：字号通过 data 属性切换 CSS 预设块；字体族通过 token setProperty 注入（custom 取用户输入字符串）
+  // 字号与命名字体预设由 data 属性选择 CSS token；只有 custom 字体需要注入用户输入。
   useEffect(() => {
     const root = document.documentElement;
+    const uiFontSize = settings.uiFontSize ?? settings.fontSize;
+    const chatFontSize = settings.chatFontSize ?? settings.fontSize;
+    const inputFontSize = settings.inputFontSize ?? settings.fontSize;
+    root.dataset.uiFontSize = uiFontSize;
+    root.dataset.chatFontSize = chatFontSize;
+    root.dataset.inputFontSize = inputFontSize;
+    // 旧属性保留，兼容外部依赖或测试仍读取 dataset.fontSize 的场景
     root.dataset.fontSize = settings.fontSize;
-    root.style.setProperty(
-      "--font-family-base",
-      resolveFontBaseStack(settings.fontFamilyBase, settings.fontFamilyBaseCustom),
-    );
-    root.style.setProperty(
-      "--font-family-mono",
-      resolveFontMonoStack(settings.fontFamilyMono, settings.fontFamilyMonoCustom),
-    );
+    root.dataset.fontBase = settings.fontFamilyBase;
+    root.dataset.fontMono = settings.fontFamilyMono;
+
+    const baseCustomFont = settings.fontFamilyBaseCustom.trim();
+    if (settings.fontFamilyBase === "custom" && baseCustomFont) {
+      root.style.setProperty("--font-family-base", baseCustomFont);
+    } else {
+      root.style.removeProperty("--font-family-base");
+    }
+
+    const monoCustomFont = settings.fontFamilyMonoCustom.trim();
+    if (settings.fontFamilyMono === "custom" && monoCustomFont) {
+      root.style.setProperty("--font-family-mono", monoCustomFont);
+    } else {
+      root.style.removeProperty("--font-family-mono");
+    }
   }, [
     settings.fontSize,
+    settings.uiFontSize,
+    settings.chatFontSize,
+    settings.inputFontSize,
     settings.fontFamilyBase,
     settings.fontFamilyBaseCustom,
     settings.fontFamilyMono,
@@ -2261,6 +2309,43 @@ export function App() {
     setPiStatus(status);
   }
 
+  /**
+   * 检查 npm 是否可用。
+   * 通过主进程执行 npm --version 检测系统中是否安装了 npm。
+   */
+  async function checkNpm() {
+    setNpmChecking(true);
+    try {
+      const result = await api.pi.checkNpm();
+      setNpmAvailable(result.available);
+      setNpmVersion(result.version);
+    } finally {
+      setNpmChecking(false);
+    }
+  }
+
+  /**
+   * 执行安装命令的 handler。
+   * 调用主进程执行命令，根据退出码判断成功/失败。
+   */
+  async function execInstallCommand() {
+    const cmd = installCommand.trim();
+    if (!cmd) return;
+    setInstallExecuting(true);
+    setInstallResult(null);
+    setInstallCompleted(false);
+    try {
+      const result = await api.pi.execInstall(cmd);
+      setInstallResult(result);
+      // 退出码 0 表示成功（npm install 成功时 exitCode 为 0）
+      if (result.success && result.exitCode === 0) {
+        setInstallCompleted(true);
+      }
+    } finally {
+      setInstallExecuting(false);
+    }
+  }
+
   function showToast(message: string, duration = 3500) {
     setToast(message);
     window.setTimeout(() => setToast(null), duration);
@@ -2475,6 +2560,11 @@ export function App() {
     // 清除之前 diffFilePath 可能残留的 modifiedContent 缓存，
     // 避免 FileDiffViewer 跳过磁盘读取而展示旧数据。
     setDiffViewModifiedContent(undefined);
+    // 侧栏模式下才打开 drawer；弹框模式由 <FileDiffViewer> 自行渲染
+    if (editorMode === "drawer") {
+      setDrawer("editor");
+      setDrawerCollapsed(false);
+    }
   }
 
   function diffFilePath(path: string, originalContent?: string, content?: string) {
@@ -2487,6 +2577,11 @@ export function App() {
     // 修改后内容优先使用调用侧传入的 content（历史会话摘要数据），
     // 其次使用当前会话的 modifiedFiles 缓存；两者皆无时 FileDiffViewer 会回退到读磁盘。
     setDiffViewModifiedContent(content ?? modified?.content ?? undefined);
+    // 侧栏模式下才打开 drawer
+    if (editorMode === "drawer") {
+      setDrawer("editor");
+      setDrawerCollapsed(false);
+    }
   }
 
   async function refreshSessionHistory(projectId = sessionsProjectId) {
@@ -5855,14 +5950,31 @@ ${goalTextRef.current}
         data-open={drawer && !drawerCollapsed}
         data-rendered={Boolean(drawerContentPanel)}
       >
-        {drawerContentPanel === "browser" && !drawerCollapsed && !browserFullscreen ? (
+        {editorMode === "drawer" && drawerContentPanel === "editor" && !drawerCollapsed && diffViewFile ? (
+          <Suspense fallback={<div className="drawer-content-frame"><div className="file-diff-loading">Loading...</div></div>}>
+            <FileDiffViewer
+              displayMode="drawer"
+              filePath={diffViewFile}
+              mode={diffViewMode}
+              onToggleMode={toggleEditorMode}
+              originalContent={diffViewMode === "diff" ? diffViewOriginalContent : undefined}
+              modifiedContent={diffViewModifiedContent}
+              onClose={() => { setDiffViewFile(null); setDiffViewMode("view"); setDrawer(null); }}
+              readContent={(path) => api.files.readContent(path)}
+              readOriginalContent={(path) => api.git.originalContent(path)}
+              saveContent={(path, content) => api.files.writeContent(path, content)}
+              theme={document.documentElement.dataset.theme === "dark" ? "dark" : "light"}
+              maxFileSizeMB={settings.maxEditorFileSizeMB}
+            />
+          </Suspense>
+        ) : drawerContentPanel === "browser" && !drawerCollapsed && !browserFullscreen ? (
           <div className="drawer-content-frame">
             <BrowserPanel
               onClose={() => setDrawer(null)}
               onToggleFullscreen={() => setBrowserFullscreen(true)}
             />
           </div>
-        ) : drawerContentPanel && drawerContentPanel !== "browser" ? (
+        ) : drawerContentPanel && drawerContentPanel !== "browser" && drawerContentPanel !== "editor" ? (
           <LazyWrapper
             className="drawer-content-frame"
             enabled={true}
@@ -6292,9 +6404,18 @@ ${goalTextRef.current}
           onClose={() => {
             setEnvironmentDialog(false);
             setCustomPathResult(null);
+            // 关闭时重置安装状态
+            setInstallResult(null);
+            setInstallCompleted(false);
+            setNpmAvailable(null);
           }}
           onRecheck={() => {
             setCustomPathResult(null);
+            setNpmAvailable(null);
+            setNpmVersion(undefined);
+            setInstallResult(null);
+            setInstallCompleted(false);
+            setInstallUseMirror(false);
             checkPiInstall("manual");
           }}
           onOpenInstallDocs={() =>
@@ -6312,6 +6433,46 @@ ${goalTextRef.current}
           onValidateCustomPath={() =>
             validateCustomPiPath({ closeDialogOnSuccess: true })
           }
+          npmAvailable={npmAvailable}
+          npmVersion={npmVersion}
+          npmChecking={npmChecking}
+          installCommand={installCommand}
+          installUseMirror={installUseMirror}
+          installExecuting={installExecuting}
+          installResult={installResult}
+          installCompleted={installCompleted}
+          onCheckNpm={checkNpm}
+          onInstallCommandChange={(cmd) => {
+            setInstallCommand(cmd);
+            setInstallResult(null);
+            setInstallCompleted(false);
+          }}
+          onToggleInstallMirror={() => {
+            setInstallUseMirror((prev) => {
+              // 切换镜像，同时更新命令文本
+              if (prev) {
+                // 移除镜像
+                setInstallCommand((cmd) =>
+                  cmd.replace(
+                    /\s+--registry=https:\/\/registry\.npmmirror\.com/g,
+                    "",
+                  ),
+                );
+              } else {
+                // 添加镜像
+                setInstallCommand((cmd) =>
+                  cmd.includes("--registry=")
+                    ? cmd
+                    : cmd + " --registry=https://registry.npmmirror.com",
+                );
+              }
+              return !prev;
+            });
+            setInstallResult(null);
+            setInstallCompleted(false);
+          }}
+          onExecInstall={execInstallCommand}
+          onRestartApp={() => api.app.restart()}
         />
       )}
       {promptTemplatePickerOpen && (
@@ -6449,11 +6610,13 @@ ${goalTextRef.current}
         />
       </Suspense>
       )}
-      {diffViewFile && (
+      {editorMode === "modal" && diffViewFile && (
         <Suspense fallback={<div className="modal-backdrop"><span className="file-diff-loading">Loading...</span></div>}>
         <FileDiffViewer
+          displayMode="modal"
           filePath={diffViewFile}
           mode={diffViewMode}
+          onToggleMode={toggleEditorMode}
           originalContent={diffViewMode === "diff" ? diffViewOriginalContent : undefined}
           modifiedContent={diffViewModifiedContent}
           onClose={() => { setDiffViewFile(null); setDiffViewMode("view"); }}
