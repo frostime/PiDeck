@@ -1,6 +1,15 @@
 import { shell } from "electron";
-import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { existsSync, type Dirent } from "node:fs";
+import {
+	mkdir,
+	readdir,
+	readFile,
+	realpath,
+	rename,
+	rm,
+	stat,
+	writeFile,
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type {
@@ -9,6 +18,7 @@ import type {
 	PiSkillLocation,
 	PiSkillSummary,
 } from "../../shared/types";
+import type { WslEnvironment } from "../wsl/WslPaths";
 
 const SKILL_FILE = "SKILL.md";
 
@@ -17,10 +27,19 @@ const SKILL_FILE = "SKILL.md";
  * 第一版仅操作全局目录，不触碰项目级 .pi/.agents skills，避免误删项目资产或绕过 trusted project 规则。
  */
 export class SkillManager {
-	private readonly locations: PiSkillLocation[];
+	private locations: PiSkillLocation[];
 
-	constructor(home = homedir()) {
-		this.locations = [
+	constructor(home?: string) {
+		this.locations = this.buildLocations(home ?? homedir());
+	}
+
+	/** 将 skill 目录切换到统一解析出的 WSL HOME；null 恢复 Windows home。 */
+	configureWsl(environment: WslEnvironment | null) {
+		this.locations = this.buildLocations(environment?.windowsHome ?? homedir());
+	}
+
+	private buildLocations(home: string): PiSkillLocation[] {
+		return [
 			{
 				id: "pi-global",
 				label: "~/.pi/agent/skills",
@@ -40,7 +59,16 @@ export class SkillManager {
 		const skills = (
 			await Promise.all(this.locations.map((location) => this.scanLocation(location)))
 		).flat();
-		return { locations: this.locations, skills };
+		// 按 name 去重，优先保留 pi-global 目录下的条目
+		// （避免 ~/.pi/agent/skills/ 和 ~/.agents/skills/ 不同步导致同名重复）
+		const seen = new Map<string, PiSkillSummary>();
+		for (const skill of skills) {
+			const key = skill.name.toLowerCase();
+			if (!seen.has(key) || (seen.get(key)!.sourceId !== "pi-global" && skill.sourceId === "pi-global")) {
+				seen.set(key, skill);
+			}
+		}
+		return { locations: this.locations, skills: Array.from(seen.values()) };
 	}
 
 	async create(input: CreatePiSkillInput): Promise<PiSkillSummary> {
@@ -93,22 +121,49 @@ export class SkillManager {
 		await mkdir(location.path, { recursive: true });
 		const entries = await readdir(location.path, { withFileTypes: true }).catch(() => []);
 		const skills: PiSkillSummary[] = [];
+		const ancestors = new Set<string>();
+		const canonicalLocation = await realpath(location.path).catch(() => null);
+		if (canonicalLocation) ancestors.add(canonicalLocation);
 		for (const entry of entries) {
 			const fullPath = join(location.path, entry.name);
-			if (entry.isDirectory()) {
-				await this.collectDirectorySkills(fullPath, location, skills);
-			} else if (location.rootMarkdownEnabled && entry.isFile() && entry.name.toLowerCase().endsWith(".md")) {
+			const kind = await this.getEntryKind(fullPath, entry);
+			if (kind === "directory") {
+				await this.collectDirectorySkills(fullPath, location, skills, ancestors);
+			} else if (location.rootMarkdownEnabled && kind === "file" && entry.name.toLowerCase().endsWith(".md")) {
 				skills.push(await this.readSkill(fullPath, location, "markdown"));
 			}
 		}
 		return skills.sort((a, b) => a.name.localeCompare(b.name));
 	}
 
+	private async getEntryKind(
+		fullPath: string,
+		entry: Dirent,
+	): Promise<"directory" | "file" | "other"> {
+		if (entry.isDirectory()) return "directory";
+		if (entry.isFile()) return "file";
+		if (!entry.isSymbolicLink()) return "other";
+
+		const target = await stat(fullPath).catch(() => null);
+		if (!target) return "other";
+		if (target.isDirectory()) return "directory";
+		if (target.isFile()) return "file";
+		return "other";
+	}
+
 	private async collectDirectorySkills(
 		dir: string,
 		location: PiSkillLocation,
 		out: PiSkillSummary[],
+		ancestors = new Set<string>(),
 	) {
+		const canonicalDir = await realpath(dir).catch(() => null);
+		if (!canonicalDir || ancestors.has(canonicalDir)) return;
+
+		// 只记录当前递归链，避免软连接环路；不同入口仍保留各自的 Skill 路径。
+		const nextAncestors = new Set(ancestors);
+		nextAncestors.add(canonicalDir);
+
 		const skillPath = join(dir, SKILL_FILE);
 		if (existsSync(skillPath)) {
 			out.push(await this.readSkill(skillPath, location, "directory"));
@@ -116,7 +171,10 @@ export class SkillManager {
 		}
 		const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
 		for (const entry of entries) {
-			if (entry.isDirectory()) await this.collectDirectorySkills(join(dir, entry.name), location, out);
+			const fullPath = join(dir, entry.name);
+			if ((await this.getEntryKind(fullPath, entry)) === "directory") {
+				await this.collectDirectorySkills(fullPath, location, out, nextAncestors);
+			}
 		}
 	}
 

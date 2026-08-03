@@ -8,7 +8,21 @@
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Electron](https://img.shields.io/badge/Electron-38-47848f)
 ![React](https://img.shields.io/badge/React-19-61dafb)
-![Version](https://img.shields.io/badge/version-0.6.5-green)
+![Version](https://img.shields.io/badge/version-0.6.6-yellow)
+
+
+<!-- star-history:start -->
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/star-history/star-history-dark.svg">
+  <img alt="Star history" src="assets/star-history/star-history-light.svg">
+</picture>
+<!-- star-history:end -->
+
+---
+
+**PiDeck** 是一个开源的Pi桌面工作台，用于在本地项目目录中统一管理 pi Agent 会话，并支持导入 Codex、Claude 本地会话以便统一浏览和恢复。基于 Electron + TypeScript 构建，提供多项目工作区、AI 会话管理、Git 集成、内置终端、模型配置和插件扩展能力，让本地 AI 编码助手在多项目环境中保持统一、可追溯、可配置。
+
+**适合谁用：** 希望在桌面端同时管理多个本地项目的 AI 编程助手会话、需要统一查看会话历史与 Git 状态、并希望以图形化方式管理 pi 配置的开发者。
 
 `PiDeck` **不是** pi 的分支。它是一个轻量 Electron 外壳，通过启动多个 `pi --mode rpc` 进程，将项目管理、会话管理、对话界面、配置管理和工具编排整合到一个原生桌面应用中——所有 Agent 能力由 pi 原生提供。
 
@@ -16,22 +30,25 @@
 
 ## 📋 更新日志
 
-> **最新版本 v0.6.5**（2026-07-13）
+> **最新版本 v0.6.7**（2026-07-29）
 
-### v0.6.5 更新
-- 🚀 **Prompt 模板系统**：全新模板管理、内置模板、`/` picker 快速插入、变量占位符
-- 🚀 **Prompt/Skill 商店**：集成 prompts.chat 和 Yao Open Prompts（121 个中文 Prompt）
-- 🚀 **Git Worktree 工作区**：分支管理、会话按 worktree 分组
-- 🚀 **消息多选 & 分享**：多选转发、复制文字/图片
-- 🚀 **内置浏览器预览**：右侧抽屉浏览网页，支持多标签、全屏和移动端视口
-- 🚀 **会话管理器**：右键项目打开、多选删除、来源筛选
-- 🚀 **外部编辑器集成**：右键项目直接「打开方式」选择编辑器
-- 🚀 **xhigh 推理级别**支持
-- ✨ 公共 MonacoEditor 组件抽取、统一图标按钮、统一弹框尺寸
-- 🐛 Windows 启动崩溃修复（0x80000003）
-- 🐛 pi 压缩后进程重启断连修复、Extension RPC 生命周期修复
-- 🐛 消息交错渲染、分片 text 竖排显示、思考状态动态读取、工作区会话加载修复
-- 🔧 会话打开性能优化、IPC 裁剪、清理调试日志
+### v0.6.7 更新亮点
+- 🚀 **紧凑标题栏 + Codex 风格右侧栏**
+- 🚀 **文件编辑器收纳到 Files Tab**
+- 🚀 **文件树拖放 / 粘贴 / 移动**
+- 🚀 **@ 文件建议支持目录树与搜索**
+- 🚀 **Composer 粘贴 / 拖入路径引用**
+- 🚀 **文本链接默认内置编辑器打开**
+- 🚀 **批量提问 Tab UI**
+- 🚀 **Ctrl/Cmd+点击 Markdown 链接打开系统浏览器**
+- 🚀 **Tailwind CSS v4 + shadcn + sonner Toast**
+- 🚀 **侧栏项目展开/折叠状态持久化**
+- 🚀 **会话消息 Fork**
+- 🚀 **启动页官方 pi 拼装动画**
+- ✨ **Plan 模式流程打磨**
+- ✨ **Composer 挂件与扩展 UI**
+- ✨ **上下文压缩入口**
+- ✨ **UI 去饱和绿色**
 
 [查看完整更新日志 →](CHANGELOG.zh-CN.md)
 
@@ -58,7 +75,9 @@
 | **Git 集成** | 实时显示当前分支，支持本地 + 远程分支选择器、分支数量徽章、分支切换和新建分支。 |
 | **局域网 Web 服务** | 可在设置中启动本机 Web 服务，局域网设备可通过电脑 IP 和端口访问。 |
 | **会话活动轨迹** | 思考、工具调用和回答片段按流程聚合展示，工具详情可展开复制，状态和退出码清晰标识。 |
-| **内置浏览器预览** | 右侧抽屉内置浏览器，支持多标签、地址栏、全屏以及 PC/手机/平板视口预设，便于边对话边查看网页。 |
+| **内置浏览器预览** | 右侧抽屉内置浏览器，支持多标签、地址栏、全屏以及 PC/手机/平板视口预设，便于边对话边查看网页。HTML 文件预览也走内置浏览器，不受 iframe sandbox 限制。 |
+| **中文提示词精选** | 内置 XuePrompt 数据库（4000+ 中文提示词），支持分类/搜索/分页浏览，一键导入到本地模板。 |
+| **Prompt & Skill 商店** | prompts.chat 国际商店 + skills.sh 社区技能商店，在线搜索、浏览详情、一键安装到本地。 |
 | **回答级修改摘要** | Agent 每轮回答完成后在对应回答下方以紧凑列表展示本轮修改文件名和修改行数，Files 面板保留本次会话总览。 |
 | **上下文感知输入** | `@` 文件引用建议、`!` Shell 执行、`/` 斜线命令和命令历史——统一在同一个输入框中。 |
 | **应用更新提示** | 定时检查 GitHub Release，发现新版本后展示发布日志和推荐下载入口，下载交由系统默认浏览器处理。 |

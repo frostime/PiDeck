@@ -1,5 +1,10 @@
 import type { PiDesktopApi } from "../../preload";
-import type { AgentTab, ChatMessage, SendPromptInput } from "../../shared/types";
+import type {
+	AgentTab,
+	ChatMessage,
+	SendPromptInput,
+	SendPromptResult,
+} from "../../shared/types";
 import { t } from "./i18n";
 import { createPreviewApi } from "./previewApi";
 
@@ -147,11 +152,17 @@ export function createBrowserApi(): PiDesktopApi {
 				await refreshState();
 			},
 			prompt: async (input: SendPromptInput) => {
-				await request(`/api/agents/${encodeURIComponent(input.agentId)}/prompt`, {
-					method: "POST",
-					body: JSON.stringify({ message: input.message, streamingBehavior: input.streamingBehavior }),
-				});
-				await refreshState();
+				const response = await request<{ result: SendPromptResult }>(
+					`/api/agents/${encodeURIComponent(input.agentId)}/prompt`,
+					{
+						method: "POST",
+						body: JSON.stringify(input),
+					},
+				);
+				// The SendPromptResult is already authoritative. State refresh is best-effort and
+				// must not turn an explicit semantic rejection into an indeterminate delivery.
+				void refreshState().catch(() => undefined);
+				return response.result;
 			},
 			runtimeState: async (agentId) => {
 				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["runtimeState"]>> }>(
@@ -179,6 +190,13 @@ export function createBrowserApi(): PiDesktopApi {
 				);
 				return result.state;
 			},
+			refreshModels: async (agentId) => {
+				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["refreshModels"]>> }>(
+					`/api/agents/${encodeURIComponent(agentId)}/refresh-models`,
+					{ method: "POST", body: "{}" },
+				);
+				return result.state;
+			},
 			cycleThinking: async (agentId) => {
 				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["cycleThinking"]>> }>(
 					`/api/agents/${encodeURIComponent(agentId)}/cycle-thinking`,
@@ -195,6 +213,16 @@ export function createBrowserApi(): PiDesktopApi {
 			},
 			onState: (callback) => subscribe(stateListeners, callback),
 			onMessages: (callback) => subscribe(messageListeners, callback),
+			onThinking: () => () => undefined,
+			onNotice: () => () => undefined,
+			onLog: () => () => undefined,
+			onRpcLog: () => () => undefined,
+			onRuntimeState: () => () => undefined,
+			onUiRequest: () => () => undefined,
+			onFocusTarget: () => () => undefined,
+			onTrustRequest: () => () => undefined,
+			sendUiResponse: async () => undefined,
+			respondTrustRequest: async () => undefined,
 		},
 		settings: {
 			...base.settings,

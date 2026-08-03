@@ -14,6 +14,10 @@ export const ipcChannels = {
 	projectsListRoot: "projects:list-root",
 	projectsListWorktreeChildren: "projects:list-worktree-children",
 	projectsToggleWorktreeEnabled: "projects:toggle-worktree-enabled",
+	// 选择聊天记录目录（系统文件选择器，默认当前聊天目录）
+	projectsChooseChatPath: "projects:choose-chat-path",
+	// 设置聊天记录目录并持久化
+	projectsSetChatPath: "projects:set-chat-path",
 	editorsList: "editors:list",
 	editorsRedetect: "editors:redetect",
 	editorsUpdate: "editors:update",
@@ -24,13 +28,23 @@ export const ipcChannels = {
 	filesShowInFolder: "files:show-in-folder",
 	filesReadContent: "files:read-content",
 	filesWriteContent: "files:write-content",
+	filesCreate: "files:create",
 	filesDelete: "files:delete",
 	filesRename: "files:rename",
+	/** 复制来源路径到目标目录（支持文件和目录递归） */
+	filesCopy: "files:copy",
+	/** 移动来源路径到目标目录（同设备 rename，跨设备 cp+rm） */
+	filesMove: "files:move",
+	/** 读取文件返回 base64 编码的数据 URL，用于图片等二进制文件 */
+	filesReadBase64: "files:read-base64",
 	sessionsList: "sessions:list",
 	sessionsRename: "sessions:rename",
 	sessionsCopy: "sessions:copy",
 	sessionsExportHtml: "sessions:export-html",
 	sessionsDelete: "sessions:delete",
+	sessionsReadMessages: "sessions:read-messages",
+	sessionsReadMeta: "sessions:read-meta",
+	sessionsReadChatMessages: "sessions:read-chat-messages",
 	codexSessionsScan: "codex-sessions:scan",
 	codexSessionsImport: "codex-sessions:import",
 	claudeSessionsScan: "claude-sessions:scan",
@@ -66,21 +80,50 @@ export const ipcChannels = {
 	skillStoreSearch: "skill-store:search",
 	skillStoreGet: "skill-store:get",
 	skillStoreImport: "skill-store:import",
+	// SkillHub（api.skillhub.cn）
+	skillHubSearch: "skill-hub:search",
+	skillHubDetail: "skill-hub:detail",
+	skillHubInstall: "skill-hub:install",
 	extensionsList: "extensions:list",
 	extensionsUninstall: "extensions:uninstall",
 	extensionsInstall: "extensions:install",
-	extensionsToggle: "extensions:toggle",
+	extensionsRemoveBuiltIn: "extensions:remove-built-in",
+	extensionsRestoreBuiltIn: "extensions:restore-built-in",
 	extensionsUpdate: "extensions:update",
 	gitBranches: "git:branches",
 	gitCheckout: "git:checkout",
 	gitCreateBranch: "git:create-branch",
 	gitOriginalContent: "git:original-content",
-	gitChangedFiles: "git:changed-files",
 	gitWorktreeList: "git:worktree-list",
 	gitWorktreeCreate: "git:worktree-create",
 	gitWorktreeRemove: "git:worktree-remove",
+	gitCommitLog: "git:commit-log",
+	gitRefs: "git:refs",
+	gitBranchCompare: "git:branch-compare",
+	gitCommitDetail: "git:commit-detail",
+	gitCommitFileDiff: "git:commit-file-diff",
+	gitDiffFileBetween: "git:diff-file-between",
+	gitStatus: "git:status",
+	gitWorkspaceFileDiff: "git:workspace-file-diff",
+	gitStage: "git:stage",
+	gitUnstage: "git:unstage",
+	gitDiscard: "git:discard",
+	gitCommit: "git:commit",
+	gitCherryPick: "git:cherry-pick",
+	gitRevert: "git:revert",
+	gitReset: "git:reset",
+	gitDropCommit: "git:drop-commit",
+	gitGenerateCommitMessage: "git:generate-commit-message",
+	gitInit: "git:init",
+	gitPush: "git:push",
+	gitPull: "git:pull",
+	gitFetch: "git:fetch",
 	piCheck: "pi:check",
 	piCheckCustom: "pi:check-custom",
+	/** 获取已安装的 WSL 发行版列表（仅 Windows） */
+	wslListDistros: "wsl:list-distros",
+	/** 验证 WSL 连接：检查 distro + user 是否可达，以及 pi 是否已安装 */
+	wslValidateConnection: "wsl:validate-connection",
 	piUpdateCheck: "pi:update-check",
 	piUpdate: "pi:update",
 	/** 在系统终端中执行安装命令（npm install）并返回结果 */
@@ -88,12 +131,14 @@ export const ipcChannels = {
 	/** 检查 npm 是否可用 */
 	piCheckNpm: "pi:check-npm",
 	appInfo: "app:info",
+	appPreferredSystemLanguages: "app:preferred-system-languages",
 	appCheckUpdate: "app:check-update",
 	appDownloadUpdate: "app:download-update",
 	appInstallUpdate: "app:install-update",
 	appUpdateProgress: "app:update-progress",
 	appFeedbackEnvironment: "app:feedback-environment",
 	appOpenExternal: "app:open-external",
+	appOpenInBrowser: "app:open-in-browser",
 	appRestart: "app:restart",
 	preloadReady: "preload:ready",
 	preloadError: "preload:error",
@@ -131,21 +176,32 @@ export const ipcChannels = {
 	agentsReload: "agents:reload",
 	agentsEditMessage: "agents:edit-message",
 	agentsDeleteMessage: "agents:delete-message",
+	/** 同文件重发：截断该用户消息及其后续，不生成新会话文件 */
+	agentsPrepareResend: "agents:prepare-resend",
 	agentsRestart: "agents:restart",
 	agentsCompact: "agents:compact",
 	agentsRuntimeState: "agents:runtime-state",
 	agentsCycleModel: "agents:cycle-model",
 	agentsAvailableModels: "agents:available-models",
 	agentsSetModel: "agents:set-model",
+	/** 刷新模型配置：通知运行中的 agent 重新加载 models.json，无需重启 */
+	agentsRefreshModels: "agents:refresh-models",
 	agentsCycleThinking: "agents:cycle-thinking",
 	agentsSetThinking: "agents:set-thinking",
 	agentsState: "agents:state",
+	projectsListModels: "projects:list-models",
 	agentsEvent: "agents:event",
 	agentsMessage: "agents:message",
 	agentsLog: "agents:log",
 
 	/** 流式思考内容更新，agent 忙碌时实时推送当前思考文本 */
 	agentsThinking: "agents:thinking",
+
+	/**
+	 * 主进程 → 渲染进程的轻量 toast 通知（如 abort 已请求停止）。
+	 * 避免把瞬时状态反馈写成会话时间线里的系统卡片。
+	 */
+	agentsNotice: "agents:notice",
 
 	/** Agent Extension UI 协议：主进程 → 渲染进程，推送扩展的 UI 请求（select/confirm/input/editor） */
 	agentsUiRequest: "agents:ui-request",
@@ -185,6 +241,7 @@ export const ipcChannels = {
 	terminalClose: "terminal:close",
 	terminalData: "terminal:data",
 	terminalExit: "terminal:exit",
+	terminalShells: "terminal:shells",
 
 	// ===== 飞书桥接 =====
 	feishuConnect: "feishu:connect",
@@ -266,4 +323,8 @@ export const ipcChannels = {
 
 	// ===== 内置浏览器 =====
 	browserOpenExternal: "browser:open-external",
+
+	// ===== 系统文件选择器 =====
+	/** 打开系统原生文件/文件夹选择器，返回选中路径列表 */
+	dialogPickFiles: "dialog:pick-files",
 } as const;

@@ -5,6 +5,7 @@ import {
 	ipcMain,
 	Menu,
 	nativeImage,
+	nativeTheme,
 	net,
 	shell,
 	Tray,
@@ -12,23 +13,69 @@ import {
 import { randomUUID } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 import { createWriteStream, existsSync } from "node:fs";
-import { copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { spawn, type ChildProcess } from "node:child_process";
 import { is } from "@electron-toolkit/utils";
 import { PetSystem, type PetSystemDeps } from "./pet";
 import {
 	applyLinuxDisplayBackendWorkaround,
 	isUsingLinuxXWaylandWorkaround,
 } from "./linuxDisplayBackend";
+import {
+	readElectronChromiumSandboxPreference,
+	readPetEnabledPreference,
+	readSingleInstancePreference,
+} from "./settings/SettingsStore";
+import { acquireVersionSingleInstance } from "./singleInstance";
+import type { StartupWindowMode } from "../shared/types";
 // 使用 ?asset 后缀导入图标，electron-vite 会在构建时将其复制到输出目录并提供正确的运行时路径
 // 这解决了打包后 build/ 目录不在 asar 中导致托盘图标丢失的问题
 import iconPath from "../../build/icon.png?asset";
 
-applyLinuxDisplayBackendWorkaround();
+// 开发态与正式版隔离 userData。
+// 否则 npm run dev 会与已安装的 PiDeck 共用数据/锁，表现为「开发启动被复用到正式版窗口」。
+// 必须在读取 settings / 版本单实例锁之前设置。
+if (!app.isPackaged) {
+	const baseUserData = app.getPath("userData");
+	// 仅在尚未指向 *-dev 时追加，避免重复拼接。
+	if (!/[\\/]pi-desktop-dev$/i.test(baseUserData) && !/dev$/i.test(baseUserData)) {
+		app.setPath("userData", `${baseUserData}-dev`);
+	}
+}
 
-// Windows 上部分安全软件 / 旧 GPU 驱动会导致 Chromium 沙箱初始化触发原生断点异常（0x80000003），
-// 全局禁用沙箱。VS Code、Discord 等知名 Electron 桌面工具在 Windows 上同样默认禁用沙箱。
-if (process.platform === "win32") {
+// Linux XWayland 兼容层：仅当桌面宠物启用时才强制 ozone-platform=x11（#108，
+// 强制 XWayland 在部分 GNOME/Wayland 环境会导致主窗口不可见）。
+// ozone 平台一经启动不可更改，整个生命周期统一使用启动时快照。
+// 注意必须放在 dev userData 覆盖之后，否则 dev 模式会误读正式版的 petEnabled。
+const petEnabledAtLaunch = readPetEnabledPreference();
+applyLinuxDisplayBackendWorkaround(petEnabledAtLaunch);
+
+// Chromium 沙箱开关必须在 app.ready 前生效。
+// 默认关闭：Windows 上部分安全软件/旧 GPU 驱动会在沙箱初始化时触发原生断点（0x80000003）。
+// 用户可在「开发设置」中开启 electronChromiumSandbox，重启后走 Chromium 默认沙箱。
+const electronChromiumSandboxEnabled = readElectronChromiumSandboxPreference();
+if (!electronChromiumSandboxEnabled) {
+	// 关闭沙箱时显式附带 no-sandbox，避免部分环境仍按默认策略启用。
 	app.commandLine.appendSwitch("no-sandbox");
+}
+
+// 按「应用版本」隔离的单实例：同版本复用窗口，不同版本可并行。
+// 不用 Electron requestSingleInstanceLock：它按 userData 全局互斥，会导致 0.6.7 与 0.6.8 无法同开。
+// focus 回调稍后挂到 focusMainWindow（定义在文件后部），避免顶层 TDZ。
+let focusExistingWindow: (() => void) | null = null;
+const singleInstanceEnabled = readSingleInstancePreference();
+const versionSingleInstance = acquireVersionSingleInstance(
+	singleInstanceEnabled,
+	app.getVersion(),
+	() => {
+		focusExistingWindow?.();
+	},
+);
+const gotSingleInstanceLock = versionSingleInstance.isPrimary;
+if (singleInstanceEnabled && !gotSingleInstanceLock) {
+	// 同版本已有实例：立即退出，由主实例 watch .focus 后唤起窗口。
+	// 用 exit(0) 而不是 quit()：第二进程尚未 ready，quit 更慢。
+	app.exit(0);
 }
 
 // 开发模式下 stdout 管道可能断开导致 EPIPE 崩溃，全局静默处理
@@ -42,11 +89,25 @@ process.stderr.on("error", (err: NodeJS.ErrnoException) => {
 });
 
 process.on("uncaughtException", (error) => {
-	void appLogger?.error("process", "Uncaught exception", error);
+	// 绝不在这里 process.exit：目标是“失败可诊断”，而不是把偶发 spawn/事件错误变成整应用闪退。
+	// 尤其 macOS arm 上 pi 子进程 ENOENT/架构不匹配时，历史上曾出现 error 事件无 listener 升级为 uncaught。
+	void appLogger?.error("process", "Uncaught exception", {
+		name: error instanceof Error ? error.name : typeof error,
+		message: error instanceof Error ? error.message : String(error),
+		stack: error instanceof Error ? error.stack : undefined,
+		platform: process.platform,
+		arch: process.arch,
+	});
 	console.error("Uncaught exception:", error);
 });
 process.on("unhandledRejection", (reason) => {
-	void appLogger?.error("process", "Unhandled rejection", reason);
+	void appLogger?.error("process", "Unhandled rejection", {
+		reason: reason instanceof Error
+			? { name: reason.name, message: reason.message, stack: reason.stack }
+			: reason,
+		platform: process.platform,
+		arch: process.arch,
+	});
 	console.error("Unhandled rejection:", reason);
 });
 import { ipcChannels } from "../shared/ipc";
@@ -75,6 +136,7 @@ import type {
 	PromptStoreSearchResponse,
 	PromptStoreRawItem,
 	PromptStoreItem,
+	TerminalShell,
 	YaoPromptListResult,
 	YaoPromptDetailResult,
 } from "../shared/types";
@@ -82,6 +144,8 @@ import { ProjectStore } from "./projects/ProjectStore";
 import { FileSystemService } from "./fs/FileSystemService";
 import { AgentManager } from "./pi/AgentManager";
 import { PiLocator } from "./pi/PiLocator";
+import { PiProcess } from "./pi/PiProcess";
+import { PiRpcClient } from "./pi/PiRpcClient";
 import { testPiProxy } from "./pi/PiProxyTester";
 import { SessionScanner } from "./sessions/SessionScanner";
 import { CodexSessionImporter } from "./sessions/CodexSessionImporter";
@@ -95,14 +159,17 @@ import { ConfigManager } from "./config/ConfigManager";
 import { TerminalSessionManager } from "./terminal/TerminalSessionManager";
 import { TelemetryService } from "./telemetry/TelemetryService";
 import { PromptManager } from "./prompts/PromptManager";
-import { YaoPromptManager } from "./prompts/YaoPromptManager";
+import { XuePromptManager } from "./prompts/XuePromptManager";
 import { SkillManager } from "./skills/SkillManager";
-import { ExtensionManager } from "./extensions/ExtensionManager";
+import { BUILT_IN_EXTENSIONS, ExtensionManager } from "./extensions/ExtensionManager";
+import { restoreAllParkedExtensions } from "./pi/piExtensionFilter";
 import { ProjectResourceManager } from "./projects/ProjectResourceManager";
 import { WebServiceManager } from "./web/WebServiceManager";
 import { preparePreloadPath } from "./preloadPath";
 import { AppLogger } from "./logging/AppLogger";
 import { RpcLogger } from "./logging/RpcLogger";
+import { resolveWslEnvironment } from "./wsl/WslEnvironment";
+import type { WslEnvironment } from "./wsl/WslPaths";
 import {
 	detectExternalEditors,
 	listConfiguredExternalEditors,
@@ -111,7 +178,7 @@ import {
 	validateExternalEditorCommand,
 } from "./editors/EditorDetector";
 import { FeishuBridge } from "./feishu/FeishuBridge";
-import { wantsFeishuDoc } from "./feishu/docActions";
+import { wantsFeishuDoc, wrapHostInstruction } from "./feishu/docActions";
 import { resolveFeishuFileSendIntent } from "./feishu/fileIntent";
 import {
 	listBots,
@@ -127,7 +194,6 @@ import type { FeishuChatBinding } from "../shared/types";
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
-let internalLinkWindow: BrowserWindow | null = null;
 /** 标记是否由用户主动退出（托盘菜单「退出」），区别于窗口关闭隐藏到托盘 */
 let isQuitting = false;
 let projectStore: ProjectStore;
@@ -143,7 +209,7 @@ let piLocator: PiLocator;
 let agentManager: AgentManager;
 let configManager: ConfigManager;
 let promptManager: PromptManager;
-let yaoPromptManager: YaoPromptManager;
+let xuePromptManager: XuePromptManager;
 let skillManager: SkillManager;
 let extensionManager: ExtensionManager;
 let projectResourceManager: ProjectResourceManager;
@@ -153,6 +219,67 @@ let petSystem: PetSystem | null = null;
 let appLogger: AppLogger;
 let rpcLogger: RpcLogger;
 let feishuBridge: FeishuBridge | null = null;
+let activeWslEnvironment: WslEnvironment | null = null;
+
+/**
+ * WSL HOME 只在这里解析一次，再把同一个环境对象下发给所有文件边界消费者。
+ * 这样 root、自定义 HOME 和普通用户不会在各管理器中被分别猜测。
+ */
+async function syncWslEnvironment(settings: AppSettings): Promise<WslEnvironment | null> {
+	const environment = settings.wslEnabled && settings.wslDistro && settings.wslUser
+		? await resolveWslEnvironment(settings.wslDistro, settings.wslUser, {
+			warn: (message, detail) => {
+				console.warn(`[PiDeck] ${message}`, detail);
+				void appLogger?.warn("wsl", message, detail);
+			},
+		})
+		: null;
+
+	activeWslEnvironment = environment;
+	await sessionScanner.configureWsl(environment);
+	skillManager.configureWsl(environment);
+	promptManager.configureWsl(environment);
+	extensionManager.configureWsl(environment);
+	agentManager?.configureWsl(environment);
+	configManager?.configureWsl(environment);
+	xuePromptManager?.configureWsl(environment);
+	return environment;
+}
+
+/**
+ * 解析 pi --list-models 表格输出为 AvailableModel[]。
+ * 表格格式：provider  model  context  max-out  thinking  images
+ */
+function parsePiListModels(stdout: string): Array<{ provider: string; id: string; name?: string; thinking: boolean; supportsImages: boolean }> {
+	const lines = stdout.split(/\r?\n/).filter(Boolean);
+	if (lines.length < 2) return [];
+	// 跳过表头
+	const dataLines = lines.slice(1);
+	const models: Array<{ provider: string; id: string; name?: string; thinking: boolean; supportsImages: boolean }> = [];
+	for (const line of dataLines) {
+		// 列1: provider, 列2: model, 列6: thinking (yes/no), 列7: images (yes/no)
+		const parts = line.trim().split(/\s+/);
+		if (parts.length < 3) continue;
+		const provider = parts[0];
+		const modelId = parts[1];
+		// thinking 和 images 在倒数第二列和最后一列
+		const thinking = parts[parts.length - 2]?.toLowerCase() === "yes";
+		const images = parts[parts.length - 1]?.toLowerCase() === "yes";
+		models.push({
+			provider,
+			id: modelId,
+			name: `${provider}/${modelId}`,
+			thinking,
+			supportsImages: images,
+		});
+	}
+	return models;
+}
+
+function applyNativeThemeSource(settings: AppSettings) {
+	// 原生标题栏不受 renderer CSS 影响；跟随应用主题，避免暗色界面顶部仍是系统浅色栏。
+	nativeTheme.themeSource = settings.theme === "system" ? "system" : settings.theme;
+}
 
 const RELEASES_URL = "https://github.com/ayuayue/pi-desktop/releases";
 const LATEST_RELEASE_API =
@@ -181,17 +308,47 @@ function normalizeVersion(version: string) {
 	return version.trim().replace(/^v/i, "");
 }
 
+function parseVersion(version: string) {
+	const normalized = normalizeVersion(version);
+	const dashIdx = normalized.indexOf("-");
+	const mainVer = dashIdx >= 0 ? normalized.slice(0, dashIdx) : normalized;
+	const preRel = dashIdx >= 0 ? normalized.slice(dashIdx + 1) : "";
+	return {
+		main: mainVer.split(".").map((p) => Number(p)),
+		pre: preRel
+			? preRel.split(/[.-]/).map((p) => (isNaN(Number(p)) ? p : Number(p)))
+			: [],
+	};
+}
+
+/**
+ * 语义化版本比较，符合 semver 规范：
+ * - 主版本号（major.minor.patch）逐段比较
+ * - pre-release 版本 < 正式版（如 0.6.6-beta.1 < 0.6.6）
+ * - pre-release 之间逐段比较，数字按数值、字符串按字典序
+ */
 function compareVersions(left: string, right: string) {
-	const leftParts = normalizeVersion(left)
-		.split(/[.-]/)
-		.map((part) => Number(part) || 0);
-	const rightParts = normalizeVersion(right)
-		.split(/[.-]/)
-		.map((part) => Number(part) || 0);
-	const length = Math.max(leftParts.length, rightParts.length);
-	for (let index = 0; index < length; index += 1) {
-		const diff = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
+	const l = parseVersion(left);
+	const r = parseVersion(right);
+	const maxLen = Math.max(l.main.length, r.main.length);
+	for (let i = 0; i < maxLen; i++) {
+		const diff = (l.main[i] ?? 0) - (r.main[i] ?? 0);
 		if (diff !== 0) return diff;
+	}
+	// 主版本相等时比较 pre-release
+	if (l.pre.length === 0 && r.pre.length > 0) return 1;  // 正式版 > pre-release
+	if (l.pre.length > 0 && r.pre.length === 0) return -1; // pre-release < 正式版
+	// 两个都是 pre-release，逐段比较
+	const preLen = Math.max(l.pre.length, r.pre.length);
+	for (let i = 0; i < preLen; i++) {
+		if (l.pre[i] === undefined) return -1;
+		if (r.pre[i] === undefined) return 1;
+		if (typeof l.pre[i] === "number" && typeof r.pre[i] === "number") {
+			if (l.pre[i] !== r.pre[i]) return (l.pre[i] as number) - (r.pre[i] as number);
+		} else {
+			const cmp = String(l.pre[i]).localeCompare(String(r.pre[i]));
+			if (cmp !== 0) return cmp;
+		}
 	}
 	return 0;
 }
@@ -451,6 +608,48 @@ async function installDownloadedUpdate(filePath: string) {
 	await shell.openPath(filePath);
 }
 
+/** 从托盘/任务栏/二次启动唤起主窗口：处理最小化、隐藏到托盘两种状态。 */
+function focusMainWindow() {
+	if (!mainWindow || mainWindow.isDestroyed()) return;
+	if (mainWindow.isMinimized()) mainWindow.restore();
+	// 托盘隐藏时需重新显示任务栏按钮，否则只 focus 可能仍不可见。
+	if (typeof mainWindow.setSkipTaskbar === "function") {
+		mainWindow.setSkipTaskbar(false);
+	}
+	mainWindow.show();
+	mainWindow.focus();
+	// Windows：短暂置顶再取消，避免已有窗口在后台时 second-instance 只亮任务栏不前置。
+	if (process.platform === "win32") {
+		mainWindow.setAlwaysOnTop(true);
+		mainWindow.setAlwaysOnTop(false);
+	}
+}
+
+/**
+ * 同版本次实例请求聚焦：窗口已在则前置；若窗口尚未创建/已销毁，ready 后重建。
+ * 挂到顶层 focusExistingWindow，供版本单实例锁的 .focus 信号调用。
+ */
+function handleVersionFocusRequest() {
+	if (mainWindow && !mainWindow.isDestroyed()) {
+		focusMainWindow();
+		return;
+	}
+	void app.whenReady().then(() => {
+		if (mainWindow && !mainWindow.isDestroyed()) {
+			focusMainWindow();
+			return;
+		}
+		if (settingsStore) {
+			void createWindow().catch((error) => {
+				void appLogger?.error("app", "Failed to recreate window on version focus request", error);
+			});
+		}
+	});
+}
+
+// 顶层锁回调延后绑定：focusMainWindow / createWindow 定义在锁申请之后。
+focusExistingWindow = handleVersionFocusRequest;
+
 function setupTray() {
 	// iconPath 由 electron-vite 的 ?asset 后缀自动解析，打包后也能正确定位
 	const icon = nativeImage.createFromPath(iconPath);
@@ -459,20 +658,14 @@ function setupTray() {
 
 	// 双击托盘图标恢复窗口（Windows 常见交互）
 	tray.on("double-click", () => {
-		if (mainWindow && !mainWindow.isDestroyed()) {
-			mainWindow.show();
-			mainWindow.focus();
-		}
+		focusMainWindow();
 	});
 
 	const contextMenu = Menu.buildFromTemplate([
 		{
 			label: "显示窗口",
 			click: () => {
-				if (mainWindow && !mainWindow.isDestroyed()) {
-					mainWindow.show();
-					mainWindow.focus();
-				}
+				focusMainWindow();
 			},
 		},
 		{ type: "separator" },
@@ -487,46 +680,73 @@ function setupTray() {
 	tray.setContextMenu(contextMenu);
 }
 
-async function openExternalUrl(url: string) {
-	if (!url.startsWith("http:") && !url.startsWith("https:")) return;
+/** 启动窗口预设 → BrowserWindow 初始尺寸；fullscreen/maximized 另用 setFullScreen/maximize。 */
+function resolveStartupWindowBounds(mode: StartupWindowMode): {
+	width: number;
+	height: number;
+} {
+	switch (mode) {
+		case "normal-compact":
+			return { width: 1100, height: 720 };
+		case "normal-medium":
+			return { width: 1280, height: 840 };
+		case "normal-large":
+			return { width: 1480, height: 960 };
+		case "maximized":
+		case "fullscreen":
+		default:
+			// 全屏/最大化前仍给一个合理兜底尺寸，避免显示器信息异常时缩成最小窗
+			return { width: 1480, height: 960 };
+	}
+}
+
+/** 在窗口创建后应用启动尺寸预设；隐藏态先 maximize/fullscreen，减少首帧跳动。 */
+function applyStartupWindowMode(
+	window: BrowserWindow,
+	mode: StartupWindowMode,
+	showImmediately: boolean,
+) {
+	if (mode === "fullscreen") {
+		// setFullScreen 在某些平台要求窗口已 show；隐藏态先 maximize 再在 show 后补全屏。
+		if (showImmediately) {
+			window.setFullScreen(true);
+		} else {
+			window.maximize();
+			window.once("show", () => {
+				if (!window.isDestroyed()) window.setFullScreen(true);
+			});
+		}
+		return;
+	}
+	if (mode === "maximized") {
+		window.maximize();
+	}
+}
+
+async function openExternalUrl(url: string, forceSystem?: boolean) {
+	// 允许 http/https 以及 file:// 协议（用于本地 HTML 预览等场景）
+	if (!url.startsWith("http:") && !url.startsWith("https:") && !url.startsWith("file:")) return;
+	// forceSystem 为 true 时绕过 linkOpenMode 设置，始终用系统默认浏览器
+	if (forceSystem) {
+		await shell.openExternal(url);
+		return;
+	}
 	const settings = settingsStore.get();
 	if (settings.linkOpenMode === "internal") {
-		openInternalLinkWindow(url);
+		openInternalLinkInBrowserPanel(url);
 		return;
 	}
 	await shell.openExternal(url);
 }
 
-function openInternalLinkWindow(url: string) {
-	// 内部打开使用独立 BrowserWindow，避免外部网页导航污染主工作台，同时保留系统浏览器作为默认选项。
-	if (!internalLinkWindow || internalLinkWindow.isDestroyed()) {
-		internalLinkWindow = new BrowserWindow({
-			width: 1180,
-			height: 820,
-			minWidth: 760,
-			minHeight: 520,
-			title: "PiDeck",
-			parent: mainWindow ?? undefined,
-			webPreferences: {
-				nodeIntegration: false,
-				contextIsolation: true,
-				sandbox: true,
-			},
-		});
-		internalLinkWindow.on("closed", () => {
-			internalLinkWindow = null;
-		});
-		internalLinkWindow.webContents.setWindowOpenHandler(({ url: nextUrl }) => {
-			void openExternalUrl(nextUrl);
-			return { action: "deny" };
-		});
-	}
-	internalLinkWindow.loadURL(url).catch((error) => {
+function openInternalLinkInBrowserPanel(url: string) {
+	// 内部打开：将 URL 发送到渲染进程，由 BrowserPanel 在侧栏/弹框中加载，
+	// 替代之前的独立 BrowserWindow 方案，保持一致的浏览体验。
+	if (!mainWindow || mainWindow.isDestroyed()) {
 		void shell.openExternal(url);
-		console.warn("Failed to load internal link window, falling back to browser:", error);
-	});
-	internalLinkWindow.show();
-	internalLinkWindow.focus();
+		return;
+	}
+	mainWindow.webContents.send(ipcChannels.appOpenInBrowser, url);
 }
 
 function printStartupInfo() {
@@ -588,6 +808,7 @@ async function prepareMainPreloadPath() {
 }
 
 async function createWindow() {
+	applyNativeThemeSource(settingsStore.get());
 	const windowOptions = settingsStore.createWindowOptions();
 	const showMainWindowImmediately = shouldShowMainWindowImmediately();
 	const sourcePreloadPath = join(__dirname, "../preload/index.js");
@@ -604,21 +825,42 @@ async function createWindow() {
 		electronRendererUrl: process.env.ELECTRON_RENDERER_URL ? "set" : "unset",
 	});
 
+	// 根据用户的主题设置选择窗口背景色，避免系统标题栏与暗色主题间出现浅色条带。
+	const theme = settingsStore.get().theme;
+	const lightBg = settingsStore.get().lightBackground;
+	const isDark =
+		theme === "dark" ||
+		(theme === "system" && nativeTheme.shouldUseDarkColors);
+	const lightBgColors: Record<string, string> = {
+		white: "#ffffff",
+		warm: "#f3f4f1",
+		paper: "#f7f6f1",
+		blue: "#f4f8ff",
+		green: "#f4fbf6",
+	};
+	const backgroundColor = isDark
+		? "#111315"
+		: (lightBgColors[lightBg] ?? "#f3f4f1");
+
+	const startupWindowMode = settingsStore.get().startupWindowMode ?? "maximized";
+	const startupBounds = resolveStartupWindowBounds(startupWindowMode);
+
 	mainWindow = new BrowserWindow({
 		show: showMainWindowImmediately,
-		backgroundColor: "#eef0f3",
-		width: 1480,
-		height: 960,
+		backgroundColor,
+		width: startupBounds.width,
+		height: startupBounds.height,
 		minWidth: 880,
 		minHeight: 640,
 		title: "",
 		icon: iconPath,
 		frame: windowOptions.frame,
 		titleBarStyle: windowOptions.titleBarStyle,
-		trafficLightPosition: windowOptions.trafficLightPosition,
+		...(windowOptions.trafficLightPosition ? { trafficLightPosition: windowOptions.trafficLightPosition } : {}),
 		webPreferences: {
 			preload: mainPreloadPath,
-			sandbox: false,
+			// 与启动期 no-sandbox 开关一致；改配置后必须整应用重启。
+			sandbox: electronChromiumSandboxEnabled,
 			contextIsolation: true,
 			nodeIntegration: false,
 			webviewTag: true,
@@ -635,10 +877,12 @@ async function createWindow() {
 		printStartupInfo();
 	}
 
-	// 窗口保持隐藏时先最大化，再加载页面；避免 ready-to-show 后再最大化造成首帧布局跳变。
-	if (!showMainWindowImmediately) {
-		mainWindow.maximize();
-	}
+	// 按外观设置的启动预设调整尺寸；隐藏态先 maximize/fullscreen，减少首帧跳动。
+	applyStartupWindowMode(
+		mainWindow,
+		startupWindowMode,
+		showMainWindowImmediately,
+	);
 
 	// 所有 target="_blank" 或 window.open 的链接统一经同一入口处理，遵守用户设置的打开方式。
 	mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -670,7 +914,19 @@ async function createWindow() {
 	);
 	mainWindow.webContents.on("render-process-gone", (_event, details) => {
 		const level: AppLogLevel = details.reason === "clean-exit" ? "info" : "error";
-		void appLogger.log(level, "app", "Main window renderer process gone", details);
+		void appLogger.log(level, "app", "Main window renderer process gone", {
+			...details,
+			platform: process.platform,
+			arch: process.arch,
+		});
+	});
+	// 子进程（含 GPU/utility）异常退出：Mac 上偶发“整窗闪一下”，需要留下 reason/exitCode。
+	app.on("child-process-gone", (_event, details) => {
+		void appLogger.error("process", "Child process gone", {
+			...details,
+			platform: process.platform,
+			arch: process.arch,
+		});
 	});
 	mainWindow.webContents.on("preload-error", (_event, preloadPath, error) => {
 		void appLogger.error("app", "Main window preload failed", {
@@ -788,7 +1044,7 @@ function shouldUseDevRendererUrl() {
 }
 
 function shouldShowMainWindowImmediately() {
-	return isUsingLinuxXWaylandWorkaround();
+	return isUsingLinuxXWaylandWorkaround(petEnabledAtLaunch);
 }
 
 // ===== 飞书桥接 IPC =====
@@ -1036,6 +1292,7 @@ function registerFeishuIpc() {
 
 	// 设置 Agent 使用的飞书 Bot ID；非空表示用户手动连接当前会话，需要立即创建/复用飞书群绑定。
 	// 传入 null 时取消关联：仅移除绑定（不终止 Agent），同时清理配置映射。
+	// 返回结果给前端：以前静默 return 会导致 UI 显示“已连接”但实际没有群绑定，飞书发消息无响应。
 	ipcMain.handle(ipcChannels.feishuSessionBotSet, async (_event, agentId: string, botId: string | null) => {
 		if (!botId) {
 			setSessionBotId(agentId, undefined);
@@ -1043,20 +1300,45 @@ function registerFeishuIpc() {
 			if (feishuBridge && feishuBridge.getStatus().status === "connected") {
 				feishuBridge.removeBindingBySessionId(agentId);
 			}
-			return;
+			return { success: true };
 		}
 		const status = feishuBridge?.getStatus();
-		if (!feishuBridge || status?.status !== "connected") return;
-		if (status.botId !== botId) return;
-		setSessionBotId(agentId, botId);
+		if (!feishuBridge || status?.status !== "connected") {
+			return { success: false, message: "飞书未连接，请先在配置中连接机器人" };
+		}
+		if (status.botId !== botId) {
+			return { success: false, message: "请先切换并连接所选机器人，再绑定当前会话" };
+		}
 		const tab = agentManager.list().find((item) => item.id === agentId);
-		if (!tab) return;
-		await feishuBridge.ensureSessionMirror(tab.id, tab.title, tab.sessionPath);
+		if (!tab) {
+			return { success: false, message: "当前会话不存在或已关闭" };
+		}
+		// 先建群绑定，成功后再写映射；避免“映射成功但群创建失败”的假连接状态。
+		const chatId = await feishuBridge.ensureSessionMirror(tab.id, tab.title, tab.sessionPath);
+		if (!chatId) {
+			return {
+				success: false,
+				message:
+					"创建/复用飞书群失败。请检查：1) 开放平台已开通 im:chat 权限 2) 已配置你的 Open ID（可向 Bot 发送 /whoami 获取）",
+			};
+		}
+		setSessionBotId(agentId, botId);
+		return { success: true, chatId };
 	});
 }
 
 function registerIpc() {
-	ipcMain.handle(ipcChannels.projectsList, () => projectStore.list());
+	// 获取当前环境过滤后的项目列表（WSL 模式只显示 WSL 项目，Chat 始终显示）
+	const getVisibleProjects = () => {
+		const settings = settingsStore.get();
+		const all = projectStore.list();
+		if (settings.wslEnabled) {
+			return all.filter((p) => p.kind === "chat" || p.environment === "wsl");
+		}
+		return all.filter((p) => p.kind === "chat" || !p.environment || p.environment === "windows");
+	};
+
+	ipcMain.handle(ipcChannels.projectsList, () => getVisibleProjects());
 	ipcMain.handle(ipcChannels.editorsList, async () => listConfiguredExternalEditors(settingsStore.get()));
 	ipcMain.handle(ipcChannels.editorsChooseExecutable, async () => {
 		const options = {
@@ -1123,8 +1405,14 @@ function registerIpc() {
 		},
 	);
 	ipcMain.handle(ipcChannels.projectsAdd, async () => {
-		const project = await projectStore.chooseAndAdd();
-		void appLogger.info("project", "Project added", { projectId: project?.id, path: project?.path });
+		const settings = settingsStore.get();
+		const env = settings.wslEnabled ? "wsl" as const : "windows" as const;
+		// 上游将 WSL 初始化移到首帧后的后台任务；用户若立即点击添加项目，按需等待同一环境解析。
+		const wslEnvironment = env === "wsl"
+			? activeWslEnvironment ?? await syncWslEnvironment(settings)
+			: null;
+		const project = await projectStore.chooseAndAdd(env, wslEnvironment);
+		void appLogger.info("project", "Project added", { projectId: project?.id, path: project?.path, environment: env });
 		return project;
 	});
 	ipcMain.handle(ipcChannels.projectsRemove, async (_event, id: string) => {
@@ -1134,14 +1422,14 @@ function registerIpc() {
 		}
 		await projectStore.remove(id);
 		void appLogger.info("project", "Project removed", { projectId: id });
-		return projectStore.list();
+		return getVisibleProjects();
 	});
 	ipcMain.handle(
 		ipcChannels.projectsReorder,
 		async (_event, projectIds: string[]) => {
 			const result = await projectStore.reorder(projectIds);
 			void appLogger.info("project", "Projects reordered", { count: projectIds.length });
-			return result;
+			return getVisibleProjects();
 		},
 	);
 	ipcMain.handle(ipcChannels.projectResourcesList, async (_event, projectId: string) => {
@@ -1223,14 +1511,63 @@ function registerIpc() {
 		},
 	);
 
+	// ── 聊天项目目录设置 ──
+
+	ipcMain.handle(ipcChannels.projectsChooseChatPath, async () => {
+		// 系统文件选择器，默认定位到当前聊天目录，便于用户就地切换。
+		const result = await dialog.showOpenDialog({
+			title: "选择聊天记录目录",
+			defaultPath: projectStore.getChatProjectPath(),
+			properties: ["openDirectory"],
+		});
+		if (result.canceled || result.filePaths.length === 0) return null;
+		return result.filePaths[0];
+	});
+
+	ipcMain.handle(ipcChannels.dialogPickFiles, async (_event, options?: { title?: string }) => {
+		const result = await dialog.showOpenDialog({
+			title: options?.title ?? "选择文件或文件夹",
+			properties: ["openFile", "openDirectory", "multiSelections"],
+		});
+		return result.canceled ? [] : result.filePaths;
+	});
+
+	ipcMain.handle(
+		ipcChannels.projectsSetChatPath,
+		async (_event, path: string) => {
+			if (typeof path !== "string" || path.length === 0) throw new Error("Invalid chat path");
+			const project = await projectStore.setChatProjectPath(path);
+			// 路径变更后广播项目列表变化，渲染端据此刷新聊天项目的会话。
+			mainWindow?.webContents.send(ipcChannels.projectsChanged, getVisibleProjects());
+			void appLogger.info("project", "Chat project path updated", { path });
+			return project;
+		},
+	);
+
 	ipcMain.handle(ipcChannels.filesList, async (_event, projectId: string) => {
 		const project = projectStore.get(projectId);
 		if (!project) throw new Error(`Project not found: ${projectId}`);
 		return fileSystemService.listTree(project.path);
 	});
 
+	// 将 WSL Linux 路径转为 Windows 可访问的路径（/mnt/c → C:\，/home/... → \\wsl$\<distro>\...）
+	const toWindowsPath = (linuxPath: string): string => {
+		if (!linuxPath || /^[A-Za-z]:/.test(linuxPath)) return linuxPath; // 已是 Windows 路径
+		// /mnt/c/Users/... → C:\Users\...
+		const mntMatch = linuxPath.match(/^\/mnt\/([a-z])\/(.*)/);
+		if (mntMatch) {
+			return `${mntMatch[1].toUpperCase()}:\\${mntMatch[2].replace(/\//g, '\\')}`;
+		}
+		// /home/user/... → \\wsl$\<distro>\home\user\...
+		const settings = settingsStore.get();
+		if (settings.wslEnabled && settings.wslDistro) {
+			return `\\\\wsl$\\${settings.wslDistro}\\${linuxPath.replace(/^\//, '').replace(/\//g, '\\')}`;
+		}
+		return linuxPath;
+	};
+
 	ipcMain.handle(ipcChannels.filesOpen, async (_event, path: string) => {
-		const error = await shell.openPath(path);
+		const error = await shell.openPath(toWindowsPath(path));
 		// Electron 通过返回字符串报告打开失败；显式抛出后前端才能提示路径不存在或系统无法打开。
 		if (error) throw new Error(error);
 	});
@@ -1242,13 +1579,31 @@ function registerIpc() {
 
 	ipcMain.handle(ipcChannels.filesReadContent, async (_event, path: string) => {
 		try {
-			return await readFile(path, "utf8");
+			return await readFile(toWindowsPath(path), "utf8");
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
 				return "";
 			}
 			throw error;
 		}
+	});
+
+	/** 读取本地图片等二进制文件为 data URL，供粘贴资源管理器图片文件时附加到消息。 */
+	ipcMain.handle(ipcChannels.filesReadBase64, async (_event, path: string) => {
+		const hostPath = toWindowsPath(path);
+		const buf = await readFile(hostPath);
+		const ext = hostPath.split(/[\\/]/).pop()?.split(".").pop()?.toLowerCase() ?? "";
+		const mime =
+			ext === "jpg" || ext === "jpeg"
+				? "image/jpeg"
+				: ext === "gif"
+					? "image/gif"
+					: ext === "webp"
+						? "image/webp"
+						: ext === "bmp"
+							? "image/bmp"
+							: "image/png";
+		return `data:${mime};base64,${buf.toString("base64")}`;
 	});
 
 	ipcMain.handle(ipcChannels.filesWriteContent, async (_event, path: string, content: string) => {
@@ -1266,6 +1621,61 @@ function registerIpc() {
 		void appLogger.info("file", "File renamed", { path, newName, result });
 		return result;
 	});
+
+	ipcMain.handle(
+		ipcChannels.filesCreate,
+		async (_event, parentDir: string, name: string, type: "file" | "directory") => {
+			const result = await fileSystemService.create(parentDir, name, type);
+			void appLogger.info("file", "File/folder created", { parentDir, name, type, result });
+			return result;
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.filesCopy,
+		async (_event, sourcePaths: string[], targetDir: string) => {
+			const results: string[] = [];
+			for (const src of sourcePaths) {
+				try {
+					const name = basename(src);
+					const dest = join(targetDir, name);
+					await cp(src, dest, { recursive: true, errorOnExist: false });
+					results.push(dest);
+					void appLogger.info("file", "File/folder copied", { src, dest });
+				} catch (error) {
+					void appLogger.error("file", "File copy failed", { src, targetDir, error });
+					throw error;
+				}
+			}
+			return results;
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.filesMove,
+		async (_event, sourcePaths: string[], targetDir: string) => {
+			const results: string[] = [];
+			for (const src of sourcePaths) {
+				try {
+					const name = basename(src);
+					const dest = join(targetDir, name);
+					// 先尝试 rename（同设备快），跨设备 fallback 到 cp+rm
+					try {
+						await rename(src, dest);
+					} catch {
+						await cp(src, dest, { recursive: true });
+						await rm(src, { recursive: true, force: true });
+					}
+					results.push(dest);
+					void appLogger.info("file", "File/folder moved", { src, dest });
+				} catch (error) {
+					void appLogger.error("file", "File move failed", { src, targetDir, error });
+					throw error;
+				}
+			}
+			return results;
+		},
+	);
 
 	// Scratch Pad（草稿本）：多草稿支持，每份草稿为 drafts/ 下的独立 .md 文件
 	const draftsDir = join(app.getPath("userData"), "drafts");
@@ -1384,7 +1794,7 @@ function registerIpc() {
 	ipcMain.handle(
 		ipcChannels.filesShowInFolder,
 		async (_event, path: string) => {
-			shell.showItemInFolder(path);
+			shell.showItemInFolder(toWindowsPath(path));
 		},
 	);
 
@@ -1429,6 +1839,26 @@ function registerIpc() {
 		await sessionScanner.delete(filePath);
 		void appLogger.info("session", "Session deleted", { filePath });
 	});
+	ipcMain.handle(
+		ipcChannels.sessionsReadMessages,
+		async (_event, filePath: string) => {
+			return sessionScanner.readMessages(filePath);
+		},
+	);
+	ipcMain.handle(
+		ipcChannels.sessionsReadMeta,
+		async (_event, filePath: string) => {
+			return sessionScanner.readSessionMeta(filePath);
+		},
+	);
+	ipcMain.handle(
+		ipcChannels.sessionsReadChatMessages,
+		async (_event, filePath: string) => {
+			// SessionScanner 统一处理本地/WSL 文件读取；消息转换与压缩归档完全复用 AgentManager。
+			const content = await sessionScanner.readSessionRawText(filePath);
+			return agentManager.readSessionDisplayMessages(filePath, "_viewer", content);
+		},
+	);
 	ipcMain.handle(
 		ipcChannels.codexSessionsScan,
 		async (_event, projectId: string) => {
@@ -1506,17 +1936,8 @@ function registerIpc() {
 	ipcMain.handle(
 		ipcChannels.gitOriginalContent,
 		async (_event, filePath: string) => {
-			return gitService.getOriginalContent(filePath);
-		},
-	);
-
-	// 获取工作区中被 Git 跟踪的变更文件列表（对比 HEAD），返回到前端用于右侧文件面板。
-	ipcMain.handle(
-		ipcChannels.gitChangedFiles,
-		async (_event, projectId: string) => {
-			const project = projectStore.get(projectId);
-			if (!project) return [];
-			return gitService.getChangedFiles(project.path);
+			const maxBytes = Math.max(1, settingsStore.get().maxEditorFileSizeMB) * 1024 * 1024;
+			return gitService.getOriginalContent(filePath, maxBytes);
 		},
 	);
 
@@ -1570,10 +1991,385 @@ function registerIpc() {
 		},
 	);
 
+	// -- Git 增强：提交历史 / 分支对比 / Graph
+	ipcMain.handle(
+		ipcChannels.gitCommitLog,
+		async (_event, projectId: string, options?: { maxEntries?: number; ref?: string; path?: string; allBranches?: boolean }) => {
+			const project = projectStore.get(projectId);
+			if (!project) return [];
+			return gitService.getCommitLog(project.path, options);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitRefs,
+		async (_event, projectId: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) return [];
+			return gitService.getRefs(project.path);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitBranchCompare,
+		async (_event, projectId: string, base: string, target: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) throw new Error(`Project not found: ${projectId}`);
+			return gitService.compareBranches(project.path, base, target);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitCommitDetail,
+		async (_event, projectId: string, ref: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) return null;
+			return gitService.getCommitDetail(project.path, ref);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitCommitFileDiff,
+		async (_event, projectId: string, ref: string, filePath: string, originalPath?: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) return null;
+			const maxBytes = Math.max(1, settingsStore.get().maxEditorFileSizeMB) * 1024 * 1024;
+			return gitService.getCommitFileDiff(project.path, ref, filePath, originalPath, maxBytes);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitDiffFileBetween,
+		async (_event, projectId: string, ref1: string, ref2: string, filePath: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) return "";
+			return gitService.diffFileBetweenRefs(project.path, ref1, ref2, filePath);
+		},
+	);
+
+
+	// Git 工作区状态 + Stage/Unstage
+	ipcMain.handle(
+		ipcChannels.gitStatus,
+		async (_event, projectId: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) return { merge: [], index: [], workingTree: [], untracked: [] };
+			return gitService.getStatus(project.path);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitWorkspaceFileDiff,
+		async (_event, projectId: string, group: import("../shared/types").GitWorkspaceDiffGroup, filePath: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) return null;
+			const maxBytes = Math.max(1, settingsStore.get().maxEditorFileSizeMB) * 1024 * 1024;
+			return gitService.getWorkspaceFileDiff(project.path, group, filePath, maxBytes);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitStage,
+		async (_event, projectId: string, paths: string[]) => {
+			const project = projectStore.get(projectId);
+			if (!project) throw new Error(`Project not found: ${projectId}`);
+			await gitService.stageFiles(project.path, paths);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitUnstage,
+		async (_event, projectId: string, paths: string[]) => {
+			const project = projectStore.get(projectId);
+			if (!project) throw new Error(`Project not found: ${projectId}`);
+			await gitService.unstageFiles(project.path, paths);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitDiscard,
+		async (_event, projectId: string, group: "workingTree" | "untracked", filePath: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) throw new Error(`Project not found: ${projectId}`);
+			await gitService.discardFile(project.path, group, filePath);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitCommit,
+		async (_event, projectId: string, message: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) throw new Error(`Project not found: ${projectId}`);
+			await gitService.commit(project.path, message);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitCherryPick,
+		async (_event, projectId: string, hash: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) throw new Error(`Project not found: ${projectId}`);
+			await gitService.cherryPick(project.path, hash);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitRevert,
+		async (_event, projectId: string, hash: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) throw new Error(`Project not found: ${projectId}`);
+			await gitService.revertCommit(project.path, hash);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitReset,
+		async (_event, projectId: string, hash: string, mode: "soft" | "mixed" | "hard") => {
+			const project = projectStore.get(projectId);
+			if (!project) throw new Error(`Project not found: ${projectId}`);
+			await gitService.resetToCommit(project.path, hash, mode);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitDropCommit,
+		async (_event, projectId: string, hash: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) throw new Error(`Project not found: ${projectId}`);
+			await gitService.dropCommit(project.path, hash);
+		},
+	);
+
+	async function ensureGenProcess(
+		projectPath: string,
+		command: string,
+	): Promise<PiRpcClient> {
+		console.log("[QuickGen] ensureGenProcess", { projectPath, command, existingPid: genProcess?.pid ?? null });
+
+		// 如果已有进程还在运行，直接复用（跨项目也复用）
+		if (genProcess && genRpcClient && genProcess.exitCode === null) {
+			console.log("[QuickGen] reusing existing process, pid:", genProcess.pid);
+			genProcessCwd = projectPath;
+			resetGenIdleTimer();
+			return genRpcClient;
+		}
+
+		// 清理旧进程（已死才重建）
+		if (genProcess) {
+			console.log("[QuickGen] stopping old process");
+			stopGenProcess();
+		}
+
+		const settings = settingsStore.get();
+		const invocation = piLocator.createInvocation(command, [
+			"--mode", "rpc",
+			"--no-session",
+			"--no-tools",
+			"--no-extensions",
+			"--no-skills",
+			"--no-prompt-templates",
+			"--no-context-files",
+			"--no-themes",
+			"--thinking", "off",
+		]);
+
+		console.log("[QuickGen] spawning", { command: invocation.command, args: invocation.args, cwd: projectPath });
+
+		genProcess = spawn(invocation.command, invocation.args, {
+			cwd: projectPath,
+			env: piLocator.createProcessEnv(settings, invocation.pathPrefix, invocation.wsl),
+			stdio: ["pipe", "pipe", "pipe"],
+			shell: invocation.shell,
+			windowsHide: true,
+			windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+		});
+		genProcessCwd = projectPath;
+		console.log("[QuickGen] spawned, pid:", genProcess.pid);
+
+		genRpcClient = new PiRpcClient(genProcess.stdin!, genProcess.stdout!);
+		console.log("[QuickGen] RPC client created");
+
+		// stderr 仅用于调试日志
+		genProcess.stderr!.on("data", (chunk: Buffer) => {
+			const text = chunk.toString("utf8").slice(0, 300);
+			console.log("[QuickGen] stderr:", text);
+			void appLogger?.warn("git", "QuickGen stderr", text);
+		});
+
+		// 进程退出时清理状态
+		genProcess.on("exit", (code, signal) => {
+			console.log("[QuickGen] process exited", { code, signal });
+			void appLogger?.warn("git", "QuickGen process exited", { code, signal });
+			stopGenProcess();
+		});
+
+		genProcess.on("error", (err) => {
+			console.log("[QuickGen] process ERROR", err.message);
+			void appLogger?.error("git", "QuickGen process error", err.message);
+		});
+
+		resetGenIdleTimer();
+		return genRpcClient;
+	}
+
+	/** 通过持久化的 RPC 进程快速生成文本 */
+	async function quickGenerate(projectPath: string, prompt: string): Promise<string> {
+		console.log("[QuickGen] quickGenerate called", { projectPath });
+		const settings = settingsStore.get();
+		const command = piLocator.resolveCommand(
+			settings.customPiPath,
+			settings.wslEnabled,
+			settings.wslDistro,
+			settings.wslUser,
+		);
+		console.log("[QuickGen] resolved command", { command });
+
+		const rpc = await ensureGenProcess(projectPath, command);
+		console.log("[QuickGen] process ready, sending prompt", { length: prompt.length });
+
+		return new Promise<string>((resolve, reject) => {
+			const collected: string[] = [];
+			let settled = false;
+			const timeout = setTimeout(() => {
+				if (!settled) {
+					console.log("[QuickGen] TIMEOUT", { collected: collected.join("").slice(0, 200) });
+					void appLogger?.warn("git", "QuickGen timed out", { collected: collected.join("").slice(0, 200) });
+					reject(new Error("Quick generate timed out"));
+				}
+			}, 60_000);
+
+			const onEvent = (event: Record<string, unknown>) => {
+				const eventType = event.type as string;
+				if (eventType === "message_update") {
+					const ae = (event as Record<string, unknown>).assistantMessageEvent as Record<string, unknown> | undefined;
+					if (ae?.type === "text_delta" && typeof ae.delta === "string") {
+						collected.push(ae.delta);
+						console.log("[QuickGen] text_delta", { delta: ae.delta.slice(0, 50) });
+					}
+				}
+				if (eventType === "agent_settled" || eventType === "agent_end") {
+					console.log("[QuickGen] event received", { eventType });
+					settled = true;
+					clearTimeout(timeout);
+					rpc.off("event", onEvent);
+					const text = collected.join("");
+					console.log("[QuickGen] completed", { length: text.length });
+					void appLogger?.warn("git", "QuickGen completed", { length: text.length });
+					resolve(text);
+				}
+			};
+
+			rpc.on("event", onEvent);
+
+			console.log("[QuickGen] sending prompt via RPC");
+			rpc.request({ type: "prompt", message: prompt }).then((response) => {
+				console.log("[QuickGen] prompt response", { success: response.success, error: response.error });
+				if (!response.success) {
+					clearTimeout(timeout);
+					rpc.off("event", onEvent);
+					reject(new Error(response.error ?? "Prompt rejected"));
+				}
+			}).catch((err) => {
+				console.log("[QuickGen] prompt request failed", { error: err.message });
+				clearTimeout(timeout);
+				rpc.off("event", onEvent);
+				reject(err);
+			});
+		});
+	}
+
+	console.log("[QuickGen] gitGenerateCommitMessage handler registered");
+	ipcMain.handle(
+		ipcChannels.gitGenerateCommitMessage,
+		async (_event, projectId: string) => {
+			console.log("[QuickGen] IPC handler called", { projectId });
+			const project = projectStore.get(projectId);
+			if (!project) {
+				console.log("[QuickGen] project not found");
+				return "";
+			}
+
+			const diff = await gitService.getStagedDiff(project.path, 10000);
+			if (!diff.trim()) {
+				console.log("[QuickGen] no staged diff");
+				return "";
+			}
+			console.log("[QuickGen] diff obtained", { length: diff.length });
+
+			// 从设置中读取提示词模板，替换 {diff} 为实际 diff 内容
+			const promptTemplate = settingsStore.get().gitCommitMessagePrompt ||
+				"请根据以下 git diff 生成一条中文 git commit message。\n\n{diff}\n\n直接输出 commit 消息。";
+			const prompt = promptTemplate.replace("{diff}", diff.slice(0, 8000));
+
+			try {
+				console.log("[QuickGen] calling quickGenerate");
+				const result = await quickGenerate(project.path, prompt);
+				console.log("[QuickGen] done", { length: result.length });
+				void appLogger?.warn("git", "Generate commit message result", { length: result.length, text: result.slice(0, 100) });
+				return result.trim();
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				console.log("[QuickGen] FAILED", { error: msg });
+				void appLogger?.warn("git", "Generate commit message failed", { error: msg });
+				throw err;
+			}
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitPush,
+		async (_event, projectId: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) throw new Error(`Project not found: ${projectId}`);
+			await gitService.push(project.path);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitPull,
+		async (_event, projectId: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) throw new Error(`Project not found: ${projectId}`);
+			await gitService.pull(project.path);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitFetch,
+		async (_event, projectId: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) throw new Error(`Project not found: ${projectId}`);
+			await gitService.fetch(project.path);
+		},
+	);
+
+	ipcMain.handle(
+		ipcChannels.gitInit,
+		async (_event, projectId: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) throw new Error(`Project not found: ${projectId}`);
+			const { execFile } = await import("node:child_process");
+			const { promisify } = await import("node:util");
+			const execFileAsync = promisify(execFile);
+			// 初始化仓库并创建 main 分支，生成一个初始空提交
+			await execFileAsync("git", ["init"], { cwd: project.path });
+			try {
+				await execFileAsync("git", ["checkout", "-b", "main"], { cwd: project.path });
+			} catch {
+				// 部分 git 版本在无提交时 checkout -b 可能失败，改用 branch -M
+				await execFileAsync("git", ["branch", "-M", "main"], { cwd: project.path });
+			}
+			await execFileAsync("git", ["commit", "--allow-empty", "-m", "Initial commit"], {
+				cwd: project.path,
+				env: { ...process.env, GIT_AUTHOR_NAME: "PiDeck", GIT_AUTHOR_EMAIL: "pideck@local", GIT_COMMITTER_NAME: "PiDeck", GIT_COMMITTER_EMAIL: "pideck@local" },
+			});
+		},
+	);
+
 	ipcMain.handle(ipcChannels.piCheck, async () => {
 		// 用户手动指定的路径优先于自动检测
 		const settings = settingsStore.get();
-		const status = await piLocator.check(settings.customPiPath);
+		const status = await piLocator.check(settings.customPiPath, settings.wslEnabled, settings.wslDistro, settings.wslUser);
 		void appLogger.info("pi", "Pi check completed", {
 			installed: status.installed,
 			version: status.version,
@@ -1581,6 +2377,131 @@ function registerIpc() {
 			error: status.error,
 		});
 		return status;
+	});
+	// 从 pi --list-models 获取可用模型列表（无需启动 agent）
+	// 全局缓存：首次运行后复用，避免每次打开选择器都 fork 子进程
+	let cachedListModels: ReturnType<typeof parsePiListModels> | null = null;
+	let cachedListModelsPending: Promise<ReturnType<typeof parsePiListModels>> | null = null;
+	ipcMain.handle(ipcChannels.projectsListModels, async (_event, projectId?: string) => {
+		try {
+			if (cachedListModels) return cachedListModels;
+			// 已有在途请求时复用同一个 Promise，避免并发 fork 多个 pi 进程
+			if (cachedListModelsPending) return cachedListModelsPending;
+
+			cachedListModelsPending = (async () => {
+				const settings = settingsStore.get();
+				const command = piLocator.resolveCommand(
+					settings.customPiPath,
+					settings.wslEnabled,
+					settings.wslDistro,
+					settings.wslUser,
+				);
+				const invocation = piLocator.createInvocation(command, ["--list-models"]);
+				const { execFile } = await import("node:child_process");
+				const result = await new Promise<{ stdout: string }>((resolve, reject) => {
+					execFile(invocation.command, invocation.args, {
+						env: piLocator.createProcessEnv(settings, invocation.pathPrefix, invocation.wsl),
+						shell: invocation.shell,
+						windowsHide: true,
+						timeout: 15_000,
+						encoding: "utf8",
+						windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+					}, (error, stdout, stderr) => {
+						if (error) {
+							const message = (stderr || error.message).slice(0, 300);
+							reject(new Error(message));
+						} else {
+							resolve({ stdout });
+						}
+					});
+				});
+				const models = parsePiListModels(result.stdout);
+				cachedListModels = models;
+				return models;
+			})();
+			const models = await cachedListModelsPending;
+			return models;
+		} catch (error) {
+			cachedListModelsPending = null;
+			void appLogger.warn("pi", "Failed to list models", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return [];
+		}
+	});
+	// 智能查找 wsl.exe：优先绝对路径（含 32-bit Sysnative 绕过），全部不存在时回退到 PATH
+	const wslExeResolved = (() => {
+		const root = process.env.SystemRoot || "C:\\Windows";
+		const candidates = process.arch === "ia32"
+			? [join(root, "Sysnative", "wsl.exe"), join(root, "System32", "wsl.exe")]
+			: [join(root, "System32", "wsl.exe")];
+		for (const candidate of candidates) {
+			if (existsSync(candidate)) return { command: candidate, shell: false };
+		}
+		return { command: "wsl", shell: true };
+	})();
+	const wslExePath = wslExeResolved.command;
+	const wslShell = wslExeResolved.shell;
+	// WSL: 列出已安装的发行版（仅 Windows 有效，其他平台返回空数组）
+	ipcMain.handle(ipcChannels.wslListDistros, async () => {
+		if (process.platform !== "win32") return [] as string[];
+		try {
+			const { execFile } = await import("node:child_process");
+			return new Promise<string[]>((resolve) => {
+				execFile(wslExePath, ["-l", "-q"], { encoding: "utf8", timeout: 10_000, windowsHide: true, shell: wslShell },
+					(err, stdout) => {
+						if (err) { resolve([]); return; }
+						// 过滤空行、\0 字符、Windows 文件后缀等非法发行版名
+						const distros = stdout.split(/\r?\n/)
+							.map((s) => s.trim())
+							.filter((s) => s.length > 0 && !s.includes("\\") && !s.includes("\x00"));
+						resolve(distros);
+					});
+			});
+		} catch { return [] as string[]; }
+	});
+	// WSL: 验证连接性 — 分步检查 distro+user 可达性 和 pi 可用性
+	ipcMain.handle(ipcChannels.wslValidateConnection, async (_event, distro: string, user: string) => {
+		if (process.platform !== "win32") {
+			return { ok: false, whoami: "", piVersion: "", error: "WSL 仅在 Windows 上可用" };
+		}
+		try {
+			const { execFile } = await import("node:child_process");
+			// Step 1: 验证 distro + user 可达
+			const whoami = await new Promise<string>((resolve, reject) => {
+				execFile(wslExePath, ["-d", distro, "-u", user, "whoami"],
+					{ encoding: "utf8", timeout: 10_000, windowsHide: true, shell: wslShell },
+					(err, stdout) => {
+						if (err) { reject(err); return; }
+						resolve(stdout.trim());
+					});
+			});
+			// Step 2: 检查 pi 是否已安装
+			let piVersion = "";
+			try {
+				piVersion = await new Promise<string>((resolve, reject) => {
+					execFile(wslExePath, ["-d", distro, "-u", user, "pi", "--version"],
+						{ encoding: "utf8", timeout: 10_000, windowsHide: true, shell: wslShell },
+						(err, stdout) => {
+							if (err) { reject(err); return; }
+							resolve(stdout.trim());
+						});
+				});
+			} catch { /* pi 未安装，piVersion 保持空 */ }
+			return {
+				ok: true,
+				whoami,
+				piVersion,
+				error: piVersion ? "" : "pi CLI 未安装 — 请在 WSL 中运行 npm i -g @earendil-works/pi",
+			};
+		} catch (err) {
+			return {
+				ok: false,
+				whoami: "",
+				piVersion: "",
+				error: `无法连接到 WSL 发行版 "${distro}" 用户 "${user}"：${err instanceof Error ? err.message : String(err)}`,
+			};
+		}
 	});
 	ipcMain.handle(ipcChannels.piUpdateCheck, async () => {
 		const result = await extensionManager.checkPiUpdate();
@@ -1735,7 +2656,17 @@ function registerIpc() {
 	ipcMain.handle(ipcChannels.appInfo, () => ({
 		version: app.getVersion(),
 		releasesUrl: RELEASES_URL,
+		platform: process.platform,
 	}));
+	ipcMain.handle(ipcChannels.appPreferredSystemLanguages, () => {
+		// Renderer navigator.language can reflect Chromium launch flags or a stale browser locale.
+		// Electron exposes the OS preference order directly; use it for the "follow system" setting.
+		try {
+			return app.getPreferredSystemLanguages();
+		} catch {
+			return [];
+		}
+	});
 	ipcMain.handle(ipcChannels.appCheckUpdate, () =>
 		checkForAppUpdate(settingsStore.get().installationType),
 	);
@@ -1813,9 +2744,10 @@ function registerIpc() {
 			pi,
 		};
 	});
-	ipcMain.handle(ipcChannels.appOpenExternal, async (_event, url: string) => {
+	ipcMain.handle(ipcChannels.appOpenExternal, async (_event, url: string, forceSystem?: boolean) => {
 		// 外部链接统一经主进程打开，避免 renderer 直接依赖 shell 权限，并遵守用户设置的打开方式。
-		await openExternalUrl(url);
+		// forceSystem 为 true 时绕过 linkOpenMode 检查，始终用系统默认浏览器。
+		await openExternalUrl(url, forceSystem);
 	});
 	ipcMain.handle(ipcChannels.appRestart, async () => {
 		// 标记为退出状态，避免 closeToTray 阻止重启
@@ -1866,6 +2798,9 @@ function registerIpc() {
 			) {
 				await applyDesktopProxy(settings);
 			}
+			if ("theme" in patch) {
+				applyNativeThemeSource(settings);
+			}
 			if ("useNativeTitleBar" in patch) {
 				settingsStore.notifyTitleBarChange(mainWindow);
 			}
@@ -1885,6 +2820,10 @@ function registerIpc() {
 					}
 					throw error;
 				}
+			}
+			// WSL 设置变更时同步更新会话扫描器和配置管理器
+			if ("wslEnabled" in patch || "wslDistro" in patch || "wslUser" in patch) {
+				await syncWslEnvironment(settings);
 			}
 			return settings;
 		},
@@ -2212,10 +3151,78 @@ function registerIpc() {
 		}
 	});
 
-	// ── Yao Open Prompts（中文提示词精选） ─────────────────────────────
-	ipcMain.handle(ipcChannels.yaoPromptsList, async () => {
+	// ── Skills.sh（https://www.skills.sh） ─────────────────────────
+	/** 搜索 Skills.sh 注册中心 */
+	ipcMain.handle(ipcChannels.skillHubSearch, async (_event, opts: { query: string; limit?: number }) => {
+		const { query, limit = 50 } = opts;
 		try {
-			const result = await yaoPromptManager.list();
+			const response = await fetch(
+				`https://www.skills.sh/api/search?q=${encodeURIComponent(query)}&limit=${limit}`,
+				{ signal: AbortSignal.timeout(15_000) },
+			);
+			if (!response.ok) throw new Error(`API 返回 ${response.status}`);
+			const json = (await response.json()) as {
+				skills?: Array<{ id: string; skillId: string; name: string; installs: number; source: string }>;
+			};
+			const skills = json.skills ?? [];
+			// skills.sh 的 id 格式为 "source/skillName"，提取 package 名用于安装
+			const items = skills.map((item) => ({
+				slug: item.id,
+				name: item.name,
+				description: "",
+				description_zh: "",
+				iconUrl: undefined,
+				stars: 0,
+				downloads: item.installs,
+				installs: item.installs,
+				category: "",
+				version: "",
+				ownerName: item.source,
+				source: "skills.sh",
+			}));
+			// 按安装量降序排列
+			items.sort((a, b) => b.installs - a.installs);
+			return { query, total: items.length, items };
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			throw new Error(`搜索 Skills.sh 失败: ${message}`);
+		}
+	});
+
+	/** 获取 Skills.sh skill 详情（直接返回 null，用不到） */
+	ipcMain.handle(ipcChannels.skillHubDetail, async () => null);
+
+	/** 安装 Skills.sh skill：npx skills add <package> */
+	ipcMain.handle(ipcChannels.skillHubInstall, async (_event, slug: string) => {
+		// slug 是 "source/skillName" 格式，例如 "anthropics/skills/pdf"
+		const lastSlash = slug.lastIndexOf("/");
+		const pkg = lastSlash > 0 ? slug.slice(0, lastSlash) : slug;
+		const skillName = lastSlash > 0 ? slug.slice(lastSlash + 1) : "";
+		try {
+			const { exec } = await import("node:child_process");
+			const { promisify } = await import("node:util");
+			const execAsync = promisify(exec);
+			// -g 安装到用户全局目录, -s 指定单个 skill, -y 跳过交互确认
+			const cmd = `npx skills add "${pkg}" -g -s "${skillName}" -y`;
+			await execAsync(cmd, { encoding: "utf8", timeout: 120_000, maxBuffer: 10 * 1024 * 1024 });
+			void appLogger.info("skill-hub", "Installed skill", { slug, pkg, skillName });
+			return { success: true, slug, installDir: "" };
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			void appLogger.warn("skill-hub", "Install failed", { slug, error: message });
+			return { success: false, slug, installDir: "", error: message };
+		}
+	});
+
+	// ── Yao Open Prompts（中文提示词精选） ─────────────────────────────
+	ipcMain.handle(ipcChannels.yaoPromptsList, async (_event, opts?: {
+		category?: string;
+		search?: string;
+		page?: number;
+		pageSize?: number;
+	}) => {
+		try {
+			const result = await xuePromptManager.list(opts);
 			return result;
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
@@ -2226,7 +3233,7 @@ function registerIpc() {
 
 	ipcMain.handle(ipcChannels.yaoPromptsDetail, async (_event, slug: string, category: string) => {
 		try {
-			const result = await yaoPromptManager.detail(slug, category);
+			const result = await xuePromptManager.detail(slug, category);
 			if (!result) throw new Error(`未找到提示词: ${slug}`);
 			return result;
 		} catch (err) {
@@ -2238,7 +3245,7 @@ function registerIpc() {
 
 	ipcMain.handle(ipcChannels.yaoPromptsImport, async (_event, slug: string, category: string) => {
 		try {
-			const result = await yaoPromptManager.importToPi(slug, category);
+			const result = await xuePromptManager.importToPi(slug, category);
 			void appLogger.info("yao-prompts", "Imported to pi templates", { slug, localName: result.name });
 			return result;
 		} catch (err) {
@@ -2248,7 +3255,10 @@ function registerIpc() {
 		}
 	});
 
-	ipcMain.handle(ipcChannels.extensionsList, () => extensionManager.list());
+	// forceRefresh=true 时跳过内存缓存，重新跑 pi list 并查 npm 版本；默认走缓存。
+	ipcMain.handle(ipcChannels.extensionsList, (_event, forceRefresh?: boolean) =>
+		extensionManager.list(Boolean(forceRefresh)),
+	);
 	ipcMain.handle(ipcChannels.extensionsUninstall, async (_event, source: string, scope?: "user" | "project" | "unknown") => {
 		const result = await extensionManager.uninstall(source, scope);
 		void appLogger.info("extension", "Extension uninstalled", { source, scope });
@@ -2259,17 +3269,17 @@ function registerIpc() {
 		void appLogger.info("extension", "Extension installed", { source });
 		return result;
 	});
-	ipcMain.handle(ipcChannels.extensionsToggle, async (_event, source: string, enabled: boolean) => {
-		// Built-in extensions: also deploy/remove the .ts file so pi actually stops/starts loading it
-		if (source.startsWith("pi-deck-") && source.endsWith(".ts")) {
-			if (enabled) {
-				await ensurePiDeckExtension(source);
-			} else {
-				await removeStalePiDeckExtension(source);
-			}
-		}
-		await extensionManager.setEnabled(source, enabled);
-		void appLogger.info("extension", "Extension toggled", { source, enabled });
+	ipcMain.handle(ipcChannels.extensionsRemoveBuiltIn, async (_event, source: string) => {
+		// 移除内置扩展：标记跳过自动部署，并删除用户目录文件，避免 pi 仍加载导致工具冲突
+		await extensionManager.removeBuiltIn(source);
+		void appLogger.info("extension", "Built-in extension removed", { source });
+	});
+
+	ipcMain.handle(ipcChannels.extensionsRestoreBuiltIn, async (_event, source: string) => {
+		// 恢复内置扩展：从 PiDeck 移除标记中删除，并确保文件存在
+		await extensionManager.restoreBuiltIn(source);
+		await ensurePiDeckExtension(source, activeWslEnvironment?.windowsHome);
+		void appLogger.info("extension", "Built-in extension restored", { source });
 	});
 	ipcMain.handle(ipcChannels.extensionsUpdate, async () => {
 		const result = await extensionManager.updateExtensions();
@@ -2283,22 +3293,38 @@ function registerIpc() {
 			projectId: input.projectId,
 			sessionPath: input.sessionPath,
 			title: input.title,
+			platform: process.platform,
+			arch: process.arch,
 		});
-		const tab = await agentManager.create(input);
-		void appLogger.info("agent", "Agent create IPC completed", {
-			agentId: tab.id,
-			projectId: input.projectId,
-			status: tab.status,
-			sessionPath: tab.sessionPath,
-		});
-		void appLogger.info("agent", "Agent created", {
-			agentId: tab.id,
-			projectId: input.projectId,
-			title: tab.title,
-			sessionPath: tab.sessionPath,
-		});
-		// 不再自动为新会话创建飞书群；必须由用户在会话输入框的飞书菜单中手动连接后才同步。
-		return tab;
+		try {
+			const tab = await agentManager.create(input);
+			void appLogger.info("agent", "Agent create IPC completed", {
+				agentId: tab.id,
+				projectId: input.projectId,
+				status: tab.status,
+				sessionPath: tab.sessionPath,
+			});
+			void appLogger.info("agent", "Agent created", {
+				agentId: tab.id,
+				projectId: input.projectId,
+				title: tab.title,
+				sessionPath: tab.sessionPath,
+			});
+			// 不再自动为新会话创建飞书群；必须由用户在会话输入框的飞书菜单中手动连接后才同步。
+			return tab;
+		} catch (error) {
+			// createUnlocked 内部已尽量吞掉 pi 启动失败；这里兜底信任/项目查找等前置异常，
+			// 保证 IPC 层也有结构化日志，方便 Mac 闪退类反馈对照 userData/logs。
+			void appLogger.error("agent", "Agent create IPC failed", {
+				projectId: input.projectId,
+				sessionPath: input.sessionPath,
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+				platform: process.platform,
+				arch: process.arch,
+			});
+			throw error;
+		}
 	});
 	ipcMain.handle(
 		ipcChannels.agentsRename,
@@ -2366,9 +3392,13 @@ function registerIpc() {
 				}
 			}
 		}
+		// agentMessage 用隐藏标记包裹宿主指令，UI/历史展示只显示用户原文。
 		const result = await agentManager.sendPrompt(
 			agentInstruction
-				? { ...input, agentMessage: `${agentInstruction}\n\n${input.message}` }
+				? {
+						...input,
+						agentMessage: wrapHostInstruction(agentInstruction, input.message),
+					}
 				: input,
 		);
 		void appLogger.info("agent", "Prompt sent", {
@@ -2420,6 +3450,14 @@ function registerIpc() {
 		await agentManager.deleteMessage(agentId, messageId);
 		void appLogger.info("agent", "Message deleted", { agentId, messageId });
 	});
+	ipcMain.handle(
+		ipcChannels.agentsPrepareResend,
+		async (_event, agentId: string, messageId: string) => {
+			const result = await agentManager.prepareResendFromMessage(agentId, messageId);
+			void appLogger.info("agent", "Message prepared for resend", { agentId, messageId });
+			return result;
+		},
+	);
 	ipcMain.handle(ipcChannels.agentsReload, async (_event, agentId: string) => {
 		const result = await agentManager.reload(agentId);
 		void appLogger.info("agent", "Agent reloaded", { agentId });
@@ -2462,6 +3500,10 @@ function registerIpc() {
 			return result;
 		},
 	);
+	ipcMain.handle(ipcChannels.agentsRefreshModels, async (_event, agentId: string) => {
+		void appLogger.info("agent", "Agent model refresh requested", { agentId });
+		return agentManager.refreshModels(agentId);
+	});
 	ipcMain.handle(ipcChannels.agentsCycleThinking, (_event, agentId: string) =>
 		agentManager.cycleThinking(agentId),
 	);
@@ -2483,20 +3525,50 @@ function registerIpc() {
 	});
 
 	/** 用户通过 UI 响应了扩展的 ask_question 请求，转发给 AgentManager 发送 extension_ui_response */
-	ipcMain.handle(ipcChannels.agentsUiResponse, async (_event, agentId: string, requestId: string, response: { value?: string | boolean; cancelled?: boolean; confirmed?: boolean }) => {
+	ipcMain.handle(ipcChannels.agentsUiResponse, async (_event, agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean }) => {
 		await agentManager.sendUIResponse(agentId, requestId, response);
 	});
 
 	ipcMain.handle(ipcChannels.terminalList, (_event, agentId: string) =>
 		terminalManager.list(agentId),
 	);
-	ipcMain.handle(ipcChannels.terminalEnsure, (_event, agentId: string) =>
-		terminalManager.ensure(agentId),
-	);
-	ipcMain.handle(ipcChannels.terminalCreate, async (_event, agentId: string) => {
-		const result = await terminalManager.create(agentId);
-		void appLogger.info("terminal", "Terminal created", { agentId, tabId: result.id });
-		return result;
+	/**
+	 * terminal ensure/create 依赖 agentManager.getCwd(agentId)。
+	 * 渲染层 pending-* 占位 id 或 agent 刚销毁时会抛 Agent not found；
+	 * 这里软失败返回空列表，避免 IPC reject → renderer unhandledrejection
+	 * （Mac 上用户感知为「一启动 agent 就闪退/报错」）。
+	 */
+	ipcMain.handle(ipcChannels.terminalEnsure, (_event, agentId: string, cwd?: string) => {
+		if (typeof agentId === "string" && agentId.startsWith("pending-")) return [];
+		try {
+			return terminalManager.ensure(agentId, cwd);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (/Agent not found/i.test(message)) {
+				void appLogger.warn("terminal", "terminal:ensure skipped, agent not ready", {
+					agentId,
+					error: message,
+				});
+				return [];
+			}
+			throw error;
+		}
+	});
+	ipcMain.handle(ipcChannels.terminalCreate, async (_event, agentId: string, shell?: string, cwd?: string) => {
+		if (typeof agentId === "string" && agentId.startsWith("pending-")) {
+			throw new Error("Terminal is not ready while agent is still starting");
+		}
+		try {
+			const result = terminalManager.create(agentId, shell as TerminalShell | undefined, cwd);
+			void appLogger.info("terminal", "Terminal created", { agentId, tabId: result.id, shell });
+			return result;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (/Agent not found/i.test(message)) {
+				throw new Error("Terminal is not ready: agent not found");
+			}
+			throw error;
+		}
 	});
 	ipcMain.handle(
 		ipcChannels.terminalInput,
@@ -2513,6 +3585,10 @@ function registerIpc() {
 	ipcMain.handle(ipcChannels.terminalClose, (_event, tabId: string) => {
 		terminalManager.close(tabId);
 		void appLogger.info("terminal", "Terminal closed", { tabId });
+	});
+
+	ipcMain.handle(ipcChannels.terminalShells, () => {
+		return terminalManager.listShells();
 	});
 
 	// ── 配置管理 ──────────────────────────────────────
@@ -2664,7 +3740,44 @@ async function detectExternalEditorsOnFirstLaunch() {
 	void appLogger.info("editor", "External editors detected on first launch", { count: detected.length });
 }
 
+// ── 持久化轻量 pi RPC 进程（用于快速文本生成，避免每次启动开销） ──────
+let genProcess: ChildProcess | null = null;
+let genRpcClient: PiRpcClient | null = null;
+let genProcessCwd = "";
+let genIdleTimer: NodeJS.Timeout | null = null;
+
+/** 清理快速生成进程，包括 RPC 客户端和空闲定时器 */
+function stopGenProcess() {
+	if (genIdleTimer) {
+		clearTimeout(genIdleTimer);
+		genIdleTimer = null;
+	}
+	genRpcClient?.close();
+	genRpcClient = null;
+	if (genProcess && genProcess.exitCode === null) {
+		try { genProcess.kill(); } catch { /* ignore */ }
+	}
+	genProcess = null;
+	genProcessCwd = "";
+}
+
+/** 重置空闲定时器：30 分钟无请求自动杀掉进程释放内存 */
+function resetGenIdleTimer() {
+	if (genIdleTimer) clearTimeout(genIdleTimer);
+	genIdleTimer = setTimeout(() => {
+		void appLogger?.debug("git", "QuickGen idle timeout, killing process");
+		stopGenProcess();
+	}, 30 * 60 * 1000);
+	if (genIdleTimer && typeof genIdleTimer === "object") genIdleTimer.unref?.();
+}
+
+// 同版本二次启动的唤起由 acquireVersionSingleInstance 的 .focus 文件 + handleVersionFocusRequest 完成。
+// 不再使用 Electron 全局 second-instance（它无法按版本区分）。
+
 app.whenReady().then(async () => {
+	// 未拿到同版本主实例锁时不要继续初始化，避免第二进程短暂闪窗。
+	if (singleInstanceEnabled && !gotSingleInstanceLock) return;
+
 	projectStore = new ProjectStore();
 	fileSystemService = new FileSystemService();
 	sessionScanner = new SessionScanner();
@@ -2679,9 +3792,14 @@ app.whenReady().then(async () => {
 	piLocator = new PiLocator();
 	configManager = new ConfigManager();
 	promptManager = new PromptManager();
-	yaoPromptManager = new YaoPromptManager();
+	xuePromptManager = new XuePromptManager();
 	skillManager = new SkillManager();
-	extensionManager = new ExtensionManager(piLocator, () => settingsStore.get());
+	extensionManager = new ExtensionManager(
+		piLocator,
+		() => settingsStore.get(),
+		() => settingsStore.get(),
+		(patch) => settingsStore.update(patch),
+	);
 	projectResourceManager = new ProjectResourceManager((projectId) => projectStore.get(projectId));
 	agentManager = new AgentManager(
 		(id) => projectStore.get(id),
@@ -2706,66 +3824,226 @@ app.whenReady().then(async () => {
 		cycleModel: (agentId) => agentManager.cycleModel(agentId),
 		availableModels: (agentId) => agentManager.getAvailableModels(agentId),
 		setModel: (agentId, provider, modelId) => agentManager.setModel(agentId, provider, modelId),
+		refreshModels: (agentId) => agentManager.refreshModels(agentId),
 		cycleThinking: (agentId) => agentManager.cycleThinking(agentId),
 		setThinking: (agentId, level) => agentManager.setThinking(agentId, level),
 	});
 	terminalManager = new TerminalSessionManager(
 		(agentId) => agentManager.getCwd(agentId),
-		(channel, payload) => mainWindow?.webContents.send(channel, payload),
+		(channel, payload) => {
+			try {
+				if (mainWindow && !mainWindow.webContents.isDestroyed()) {
+					mainWindow.webContents.send(channel, payload);
+				}
+			} catch {
+				// 窗口已关闭时静默忽略，避免 pty 后发事件抛 "Object has been destroyed"
+			}
+		},
 	);
 
+	// 启动关键路径只等设置加载与 IPC 注册，尽快 createWindow。
+	// 扩展部署、WSL 同步、代理/Web 服务/宠物等后置，避免打包后点击启动要先等一长串磁盘/网络 IO。
 	await settingsStore.load();
+	registerIpc();
+	registerFeishuIpc();
+	await createWindow();
+	setupTray();
 
-	// 自动部署 PiDeck 内置扩展：这些扩展提供桌面端差异预览、提问卡片和 Plan Mode。
-	// 放到 pi 自动发现目录后，新建/重启的 RPC Agent 会自动加载；只在内容变更时覆盖，避免用户目录产生无意义写入。
-	// Read disabled extensions so disabled built-in extensions aren't re-deployed at startup
-	const disabledExtList: string[] = await readFile(join(app.getPath("home"), ".pi", "agent", "settings.json"), "utf-8")
-		.then((raw: string) => JSON.parse(raw).disabledExtensions ?? [])
-		.catch(() => [] as string[]);
-	const disabledBuiltIn = new Set<string>(disabledExtList);
+	void runPostWindowStartupTasks().catch((error) => {
+		void appLogger.warn("app", "Post-window startup tasks failed", error);
+	});
 
-	for (const extensionName of [
-		"pi-deck-file-capture.ts",
-		"pi-deck-ask-question.ts",
-		"pi-deck-plan-mode.ts",
-		"pi-deck-todo.ts",
-	]) {
-		if (disabledBuiltIn.has(extensionName)) {
-			// 已禁用：确保 .ts 文件被移除，避免 pi 残余加载
-			await removeStalePiDeckExtension(extensionName).catch(() => {});
-			continue;
+	// macOS dock 点击或任务栏点击时恢复窗口
+	app.on("activate", () => {
+		if (mainWindow && !mainWindow.isDestroyed()) {
+			focusMainWindow();
+		} else {
+			void createWindow().catch((error) => {
+				void appLogger.error("app", "Failed to create window on activate", error);
+			});
 		}
-		await ensurePiDeckExtension(extensionName).catch((error) => {
-			console.error(`Failed to install ${extensionName}:`, error);
+	});
+});
+
+/**
+ * 窗口出现后的后台启动任务。
+ * 这些工作不影响首帧可见，但会拖慢 packaged app 的“点击图标 → 窗口出来”。
+ */
+async function runPostWindowStartupTasks(): Promise<void> {
+	// 启动后异步校准内置扩展：对比 resources 与用户目录全文，不一致则覆盖。
+	// 用户手动移除的记在 removedBuiltInExtensions，跳过自动部署。
+	const deployExtensionsTo = async (homeDir: string) => {
+		// 迁移旧的 pi disabledExtensions 配置到 PiDeck 自有设置
+		try {
+			const piSettingsPath = join(homeDir, ".pi", "agent", "settings.json");
+			const piRaw = await readFile(piSettingsPath, "utf-8").catch(() => "");
+			if (piRaw) {
+				const piSettings = JSON.parse(piRaw) as { disabledExtensions?: string[] };
+				const oldDisabled = piSettings.disabledExtensions ?? [];
+				const piDeckSettings = settingsStore.get();
+				const currentRemoved = new Set(piDeckSettings.removedBuiltInExtensions ?? []);
+				let changed = false;
+				for (const entry of oldDisabled) {
+					if (entry.startsWith("pi-deck-") && !currentRemoved.has(entry)) {
+						currentRemoved.add(entry);
+						changed = true;
+					}
+				}
+				// 清除旧的 pi disabledExtensions 防止重复迁移
+				if (piSettings.disabledExtensions && piSettings.disabledExtensions.length > 0) {
+					piSettings.disabledExtensions = piSettings.disabledExtensions.filter(
+						(s) => !s.startsWith("pi-deck-")
+					);
+					await writeFile(piSettingsPath, JSON.stringify(piSettings, null, 2), "utf-8").catch(() => {});
+				}
+				if (changed) {
+					await settingsStore.update({ removedBuiltInExtensions: [...currentRemoved] });
+				}
+			}
+		} catch {
+			// 迁移失败不影响主流程
+		}
+
+		const removedBuiltIn = new Set(settingsStore.get().removedBuiltInExtensions ?? []);
+		const summary = {
+			homeDir,
+			installed: [] as string[],
+			updated: [] as string[],
+			unchanged: [] as string[],
+			skippedRemoved: [] as string[],
+			missingSource: [] as string[],
+			failed: [] as Array<{ name: string; error: string }>,
+		};
+
+		// 并行校准：磁盘 IO 为主，互不依赖
+		await Promise.all(
+			BUILT_IN_EXTENSIONS.map(async (extensionName) => {
+				if (removedBuiltIn.has(extensionName)) {
+					summary.skippedRemoved.push(extensionName);
+					// 历史「仅标记移除、文件仍保留」会让 pi 继续加载残留扩展，
+					// 与三方同名工具（如 rpiv-todo 的 todo）冲突导致 RPC 启动失败。启动时清残留。
+					try {
+						await rm(join(homeDir, ".pi", "agent", "extensions", extensionName), { force: true });
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						summary.failed.push({ name: extensionName, error: `purge residual: ${message}` });
+						console.error(`Failed to purge residual ${extensionName}:`, error);
+					}
+					return;
+				}
+				try {
+					const result = await ensurePiDeckExtension(extensionName, homeDir);
+					if (result === "installed") summary.installed.push(extensionName);
+					else if (result === "updated") summary.updated.push(extensionName);
+					else if (result === "unchanged") summary.unchanged.push(extensionName);
+					else if (result === "missing-source") summary.missingSource.push(extensionName);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					summary.failed.push({ name: extensionName, error: message });
+					console.error(`Failed to sync ${extensionName}:`, error);
+				}
+			}),
+		);
+
+		const changedCount = summary.installed.length + summary.updated.length;
+		if (changedCount > 0) {
+			// 文件有变时清扩展列表缓存，配置页/下次 list 能看到最新状态
+			extensionManager.invalidateListCache();
+		}
+
+		void appLogger.info("extension", "Built-in extensions sync finished", {
+			homeDir: summary.homeDir,
+			installed: summary.installed,
+			updated: summary.updated,
+			unchanged: summary.unchanged,
+			skippedRemoved: summary.skippedRemoved,
+			missingSource: summary.missingSource,
+			failed: summary.failed,
+			changedCount,
 		});
+		if (summary.failed.length > 0) {
+			void appLogger.warn("extension", "Some built-in extensions failed to sync", {
+				homeDir: summary.homeDir,
+				failed: summary.failed,
+			});
+		}
+	};
+
+	// 并行做无依赖的后台初始化，缩短窗口出现后的空闲等待。
+	await Promise.all([
+		syncWslEnvironment(settingsStore.get()).catch((error) => {
+			console.error("Failed to sync WSL config:", error);
+		}),
+		deployExtensionsTo(app.getPath("home")).catch((error) => {
+			console.error("Failed to deploy extensions:", error);
+		}),
+		applyDesktopProxy(settingsStore.get()).catch((error) => {
+			console.error("Failed to apply desktop proxy:", error);
+		}),
+		// 预热 pi --version 缓存：避免首次创建 Agent 时 trust 路径同步卡住 数秒。
+		PiProcess.warmVersionCache(settingsStore.get()).catch((error) => {
+			console.warn("[PiDeck] Failed to warm pi version cache:", error);
+		}),
+		appLogger.info("app", "Application started", {
+			version: app.getVersion(),
+			platform: process.platform,
+			arch: process.arch,
+			installationType: settingsStore.get().installationType,
+		}),
+	]);
+
+	// WSL 启用时额外部署到动态解析出的 HOME。
+	if (activeWslEnvironment) {
+		void deployExtensionsTo(activeWslEnvironment.windowsHome).catch(() => {
+			console.warn("[PiDeck] Failed to deploy extensions to WSL, skipping");
+		});
+	}
+
+	// 补齐 pi settings.json 缺失的默认配置项，新安装或精简配置的用户无需手动添加。
+	void ensureAllPiSettingsDefaults().catch((error) => {
+		console.error("Failed to ensure pi settings defaults:", error);
+	});
+
+	// 清理上次异常退出留下的 codeisland 停放文件，避免扩展在磁盘上永久消失。
+	try {
+		const home = app.getPath("home");
+		const restored = restoreAllParkedExtensions([
+			join(home, ".pi", "agent", "extensions"),
+		]);
+		if (restored.length > 0) {
+			void appLogger.info("extension", "Restored parked incompatible extensions from previous session", {
+				restored,
+			});
+		}
+	} catch (error) {
+		console.error("Failed to restore parked extensions:", error);
 	}
 
 	// 清理已废弃的 pi-deck-project-trust 扩展：RPC 模式下 pi 的 project_trust 事件 hasUI 恒为 false，
 	// 该扩展无法弹窗，信任确认改由桌面端 AgentManager.ensureProjectTrust 自行处理，删除残留避免用户误解。
-	await removeStalePiDeckExtension("pi-deck-project-trust.ts").catch((error) => {
+	void removeStalePiDeckExtension("pi-deck-project-trust.ts").catch((error) => {
 		console.error("Failed to remove stale pi-deck-project-trust extension:", error);
 	});
 
-	await appLogger.info("app", "Application started", {
-		version: app.getVersion(),
-		platform: process.platform,
-		arch: process.arch,
-		installationType: settingsStore.get().installationType,
+	// 清理已废弃的 pi-deck-file-capture 扩展：该扩展的功能已被 renderer 端的直接工具参数解析取代。
+	void removeStalePiDeckExtension("pi-deck-file-capture.ts").catch((error) => {
+		console.error("Failed to remove stale pi-deck-file-capture extension:", error);
 	});
-	await applyDesktopProxy(settingsStore.get());
-	await webServiceManager.applySettings(settingsStore.get()).catch((error) => {
+
+	void webServiceManager.applySettings(settingsStore.get()).catch((error) => {
 		console.error("Failed to start web service:", error);
 		void settingsStore.update({ webServiceEnabled: false });
 	});
-	registerIpc();
-	registerFeishuIpc();
 
-	// 🆕 自动连接：如果已有 Bot 配置，自动启动飞书连接
+	// 自动连接：如果已有 Bot 配置，自动启动飞书连接
 	autoConnectFeishu();
-
 	sendTelemetryHeartbeat();
-	await createWindow();
-	setupTray();
+
+	// 启动后预热扩展列表缓存，打开配置页时优先命中内存结果。
+	void extensionManager.list(false).catch((error) => {
+		void appLogger.warn("extension", "Warmup extensions list failed", error);
+	});
+
 	void detectExternalEditorsOnFirstLaunch().catch((error) => {
 		void appLogger.warn("editor", "External editor first launch detection failed", error);
 	});
@@ -2787,9 +4065,13 @@ app.whenReady().then(async () => {
 	// 项目列表可能位于杀软/同步盘较慢的 userData；窗口先显示，随后异步加载，避免 packaged app 打开时白屏等待。
 	void projectStore
 		.load()
-		.then(() =>
-			mainWindow?.webContents.send("projects:changed", projectStore.list()),
-		)
+		.then(() => {
+			const s = settingsStore.get();
+			const visible = s.wslEnabled
+				? projectStore.list().filter((p) => p.kind === "chat" || p.environment === "wsl")
+				: projectStore.list().filter((p) => p.kind === "chat" || !p.environment || p.environment === "windows");
+			mainWindow?.webContents.send("projects:changed", visible);
+		})
 		.catch(() => undefined);
 
 	// 启动后异步检查 RPC 超时时间，如果小于 600 秒则自动修正为 600 秒
@@ -2799,27 +4081,29 @@ app.whenReady().then(async () => {
 			void appLogger.warn("settings", "Failed to ensure rpcTimeout minimum", error);
 		});
 	}, 0);
+}
 
-	// macOS dock 点击或任务栏点击时恢复窗口
-	app.on("activate", () => {
-		if (mainWindow) {
-			mainWindow.show();
-			mainWindow.focus();
-		} else {
-			void createWindow().catch((error) => {
-				void appLogger.error("app", "Failed to create window on activate", error);
-			});
-		}
-	});
-});
+/** ensurePiDeckExtension 的校准结果，供启动任务汇总日志。 */
+type PiDeckExtensionSyncResult =
+	| "installed"
+	| "updated"
+	| "unchanged"
+	| "missing-source";
 
 /**
  * 将 PiDeck 内置的 pi 扩展部署到用户扩展目录，使 pi 自动加载。
- * 仅在目标文件不存在或内容不一致时覆盖写入，避免不必要的磁盘操作。
+ * 启动时异步对比 resources 源文件与 ~/.pi/agent/extensions 目标：
+ * - 目标不存在 → 安装
+ * - 内容不一致（老版本/用户手改）→ 覆盖为 PiDeck 当前版本
+ * - 内容一致 → 跳过写盘
+ * 用户在设置里「移除」的内置扩展由调用方按 removedBuiltInExtensions 跳过，本函数不读该列表。
  */
-async function ensurePiDeckExtension(extensionName: string): Promise<void> {
-	const homedir = app.getPath("home");
-	const extensionsDir = join(homedir, ".pi", "agent", "extensions");
+async function ensurePiDeckExtension(
+	extensionName: string,
+	wslHome?: string,
+): Promise<PiDeckExtensionSyncResult> {
+	const home = wslHome ?? app.getPath("home");
+	const extensionsDir = join(home, ".pi", "agent", "extensions");
 	const targetPath = join(extensionsDir, extensionName);
 
 	// 获取源文件路径：开发模式下在 resources/ 目录，打包后通过 process.resourcesPath 访问
@@ -2827,20 +4111,34 @@ async function ensurePiDeckExtension(extensionName: string): Promise<void> {
 		? join(app.getAppPath(), "resources", "extensions", extensionName)
 		: join(process.resourcesPath, "extensions", extensionName);
 
-	// 检查源文件是否存在
 	const sourceContent = await readFile(sourcePath, "utf-8").catch(() => null);
 	if (!sourceContent) {
 		console.warn(`[PiDeck] Extension source not found: ${sourcePath}`);
-		return;
+		void appLogger?.warn("extension", "Built-in extension source missing", {
+			extensionName,
+			sourcePath,
+		});
+		return "missing-source";
 	}
 
-	// 读取目标文件，只在内容不一致时覆盖（兼顾首次安装和版本更新）
 	const existingContent = await readFile(targetPath, "utf-8").catch(() => null);
-	if (existingContent === sourceContent) return;
+	// 全文比对：任意与 resources 不一致都覆盖，避免用户仍跑旧版 ask/plan/todo 扩展。
+	if (existingContent === sourceContent) {
+		return "unchanged";
+	}
 
+	const action: PiDeckExtensionSyncResult = existingContent == null ? "installed" : "updated";
 	await mkdir(extensionsDir, { recursive: true });
 	await writeFile(targetPath, sourceContent, "utf-8");
-	console.log(`[PiDeck] Installed extension: ${targetPath}`);
+	console.log(`[PiDeck] ${action === "installed" ? "Installed" : "Updated"} extension: ${targetPath}`);
+	void appLogger?.info("extension", `Built-in extension ${action}`, {
+		extensionName,
+		targetPath,
+		sourcePath,
+		previousBytes: existingContent?.length ?? 0,
+		nextBytes: sourceContent.length,
+	});
+	return action;
 }
 
 /**
@@ -2854,6 +4152,67 @@ async function removeStalePiDeckExtension(extensionName: string): Promise<void> 
 	console.log(`[PiDeck] Removed stale extension: ${targetPath}`);
 }
 
+/**
+ * 补齐 pi 全局 settings.json 的推荐默认项。
+ * 仅添加缺失的 key，不覆盖用户已有配置。
+ * 适用于新安装 pi 或配置精简的用户。
+ */
+/** 补齐指定 configDir 下 settings.json 的缺失默认项 */
+async function ensurePiSettingsDefaults(configDir: string, piVersionHint?: string): Promise<void> {
+	const filePath = join(configDir, "settings.json");
+	let current: Record<string, unknown> = {};
+	try {
+		const raw = await readFile(filePath, "utf8");
+		current = JSON.parse(raw) as Record<string, unknown>;
+	} catch { /* 文件不存在或解析失败，使用空对象 */ }
+
+	let changed = false;
+	const defaults: Record<string, unknown> = {
+		theme: "dark",
+		hideThinkingBlock: false,
+		defaultProjectTrust: "ask",
+		compaction: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
+		retry: { enabled: true, maxRetries: 3 },
+	};
+
+	if (piVersionHint && !current.lastChangelogVersion) {
+		current.lastChangelogVersion = piVersionHint;
+		changed = true;
+	}
+
+	for (const [key, defaultValue] of Object.entries(defaults)) {
+		if (!(key in current)) {
+			current[key] = defaultValue;
+			changed = true;
+		}
+	}
+
+	if (changed) {
+		await mkdir(configDir, { recursive: true });
+		await writeFile(filePath, JSON.stringify(current, null, 2), "utf8");
+		console.log('[PiDeck] Ensured pi settings defaults at:', filePath);
+	}
+}
+
+/** 对当前环境和 WSL 环境（如果启用）都补齐 settings.json 默认项 */
+async function ensureAllPiSettingsDefaults(): Promise<void> {
+	const s = settingsStore.get();
+	let piVersion = "";
+	if (piLocator) {
+		piVersion = (await piLocator.check(undefined, s.wslEnabled, s.wslDistro, s.wslUser).catch(() => null))?.version ?? "";
+	}
+
+	// Windows 本地
+	const winDir = join(app.getPath("home"), ".pi", "agent");
+	await ensurePiSettingsDefaults(winDir, piVersion).catch(() => {});
+
+	// WSL（如果已配置）
+	if (activeWslEnvironment) {
+		const wslDir = join(activeWslEnvironment.windowsHome, ".pi", "agent");
+		await ensurePiSettingsDefaults(wslDir, piVersion).catch(() => {});
+	}
+}
+
 app.on("before-quit", () => {
 	isQuitting = true;
 	tray?.destroy();
@@ -2861,8 +4220,11 @@ app.on("before-quit", () => {
 	void webServiceManager?.stop();
 	terminalManager?.closeAll();
 	agentManager?.stopAll();
+	// 退出前刷盘会话摘要缓存，保证下次冷启动可复用未变化文件的摘要。
+	void sessionScanner?.flushSummaryCache();
 	petSystem?.stop();
 	petSystem = null;
+	stopGenProcess();
 });
 
 app.on("window-all-closed", () => {

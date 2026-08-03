@@ -1,3 +1,4 @@
+import { showNotice } from "./utils/notice";
 import { Component, useState, useEffect, useCallback, type ReactNode } from "react";
 import type { PiDesktopApi } from "../../preload";
 import { AuthTab } from "./config/AuthTab";
@@ -13,7 +14,7 @@ import { ImTab } from "./config/ImTab";
 import { LogsTab } from "./config/LogsTab";
 import { CloseIconButton } from "./components/ui/IconButton";
 import { t } from "./i18n";
-import { MonacoEditor } from "./components/ui/MonacoEditor";
+import { LazyMonacoEditor } from "./components/ui/LazyMonacoEditor";
 import { translateBuiltinPromptDescription } from "./composerBehavior";
 import type {
 	AuthFile,
@@ -183,7 +184,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 	const [saving, setSaving] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [configDiagnostic, setConfigDiagnostic] = useState<ConfigFileDiagnostic | null>(null);
-	const [toast, setToast] = useState<string | null>(null);
+	/* toast 已改用 sonner 实现 */
 
 	// 各 tab 的数据
 	const [modelsData, setModelsData] = useState<ModelsFile>({ providers: {} });
@@ -433,7 +434,8 @@ function ConfigModalContent(props: ConfigModalProps) {
 			return;
 		}
 		if (section === "extensions") {
-			void refreshExtensions();
+			// 切到扩展页默认吃缓存；只有点刷新按钮才 forceRefresh。
+			void refreshExtensions(false);
 			return;
 		}
 		if (section === "editors") return;
@@ -442,8 +444,58 @@ function ConfigModalContent(props: ConfigModalProps) {
 	}, [open, section, tab, loadConfig]);
 
 	const showToast = (msg: string) => {
-		setToast(msg);
-		setTimeout(() => setToast(null), 2500);
+		showNotice(msg, 2500);
+	};
+
+	/** 去掉 Electron IPC 包装前缀，只保留真正业务错误，方便 toast 阅读。 */
+	const formatIpcError = (error: unknown): string => {
+		const raw = error instanceof Error ? error.message : String(error);
+		const matched = raw.match(
+			/Error invoking remote method '[^']+':\s*(?:Error:\s*)?([\s\S]+)$/i,
+		);
+		return (matched?.[1] ?? raw).trim();
+	};
+
+	/**
+	 * 模型配置保存后，通知所有运行中的 Agent 尝试刷新模型配置。
+	 *
+	 * 当前仅尝试 reload_config RPC（策略 1），pi 0.80.10 尚未支持此命令，
+	 * 因此实际为 no-op。进程重启方案（策略 2）已注释，原因：
+	 *   - 运行中重启会打断用户对话/工具执行
+	 *   - 涉及 exit 事件竞态、模型恢复等复杂边界
+	 *
+	 * pi 合并 https://github.com/earendil-works/pi/issues/6890 后自动生效。
+	 */
+	const refreshRunningAgents = async () => {
+		try {
+			const agents = await api.agents.list();
+			// 只刷新状态为 running 或 idle 的活跃 Agent（排除 closed/error/starting）
+			const activeAgents = agents.filter(
+				(agent) => agent.status === "running" || agent.status === "idle",
+			);
+			if (activeAgents.length === 0) return;
+
+			let refreshed = 0;
+			let failed = 0;
+			for (const agent of activeAgents) {
+				try {
+					await api.agents.refreshModels(agent.id);
+					refreshed++;
+				} catch {
+					failed++;
+				}
+			}
+
+			// pi 官方尚未支持 reload_config RPC，刷新实际为 no-op，先注释提示避免误导
+			// if (refreshed > 0 && failed === 0) {
+			// 	showToast(t("config.modelsRefreshed", { count: refreshed }));
+			// } else if (refreshed > 0) {
+			// 	showToast(t("config.modelsRefreshedPartial", { refreshed, failed }));
+			// }
+		} catch {
+			// 获取 agent 列表失败时静默忽略，模型配置已保存，下次启动 agent 生效
+		}
+
 	};
 
 	const saveAndReload = async (
@@ -556,6 +608,36 @@ function ConfigModalContent(props: ConfigModalProps) {
 		setExpandedProvider(newName);
 	};
 
+	/**
+	 * 检测成功且实际走通 /v1（或 /v1beta）时，把表单里的 baseUrl 自动改成带版本路径。
+	 * 原因：检测侧会兼容补路径，但 pi 会话会原样读 models.json；不改写则「测试正常、会话 404」。
+	 * 仅改内存表单，需用户点保存后才写入磁盘。
+	 * 后端仅在确实需要改写时返回 suggestedBaseUrl，前端直接应用即可。
+	 */
+	const applySuggestedBaseUrl = useCallback(
+		(providerName: string, suggestedBaseUrl?: string) => {
+			if (!suggestedBaseUrl) return false;
+			const next = suggestedBaseUrl.replace(/\/+$/, "");
+			if (!next) return false;
+			// 函数式更新，避免 async 返回时闭包拿到旧 modelsData。
+			setModelsData((prev) => {
+				const provider = prev.providers[providerName];
+				if (!provider) return prev;
+				const current = (provider.baseUrl ?? "").replace(/\/+$/, "");
+				if (current === next) return prev;
+				return {
+					...prev,
+					providers: {
+						...prev.providers,
+						[providerName]: { ...provider, baseUrl: next },
+					},
+				};
+			});
+			return true;
+		},
+		[],
+	);
+
 	// 从 provider 的 baseUrl + apiKey 拉取可用模型列表
 	const handleFetchModels = async (providerName: string) => {
 		const provider = modelsData.providers[providerName];
@@ -586,7 +668,19 @@ function ConfigModalContent(props: ConfigModalProps) {
 					...prev,
 					[providerName]: undefined,
 				}));
-				showToast(t("config.fetchedModels", { count: result.models.length }));
+				const normalized = applySuggestedBaseUrl(
+					providerName,
+					result.suggestedBaseUrl,
+				);
+				if (normalized && result.suggestedBaseUrl) {
+					showToast(
+						t("config.baseUrlAutoNormalized", {
+							url: result.suggestedBaseUrl,
+						}),
+					);
+				} else {
+					showToast(t("config.fetchedModels", { count: result.models.length }));
+				}
 			} else {
 				// 根据 API 类型提供不同的错误提示
 				const apiTypeHint = getFetchModelsHintByApi(provider.api as string | undefined, provider.baseUrl);
@@ -633,6 +727,20 @@ function ConfigModalContent(props: ConfigModalProps) {
 				getProviderHeaders(provider.headers),
 			);
 			setTestResult({ providerName, ...result });
+			// 测试成功且走通版本路径时，自动把根路径 baseUrl 改成 /v1 等，避免会话侧失败。
+			if (result.success && result.suggestedBaseUrl) {
+				const normalized = applySuggestedBaseUrl(
+					providerName,
+					result.suggestedBaseUrl,
+				);
+				if (normalized) {
+					showToast(
+						t("config.baseUrlAutoNormalized", {
+							url: result.suggestedBaseUrl,
+						}),
+					);
+				}
+			}
 		} catch (e) {
 			setTestResult({
 				providerName,
@@ -770,9 +878,13 @@ function ConfigModalContent(props: ConfigModalProps) {
 		};
 		await saveAndReload(
 			() => api.config.saveModels(normalizedData),
-			t("config.modelsSavedRestartHint"),
+			t("config.modelsSaved"),
 		);
 		await loadConfig("models");
+
+		// 保存后自动刷新所有运行中的 Agent，使模型配置实时生效
+		// pi 官方尚未支持，先注释
+		// void refreshRunningAgents();
 	};
 
 	// ── Auth 操作 ────────────────────────────────────────
@@ -888,10 +1000,14 @@ function ConfigModalContent(props: ConfigModalProps) {
 		const isModelsFile = rawFileName === "models.json";
 		await saveAndReload(
 			() => api.config.saveRaw(rawFileName, rawContent),
-			isModelsFile ? t("config.modelsSavedRestartHint") : undefined,
+			isModelsFile ? t("config.modelsSaved") : undefined,
 		);
-		if (isModelsFile) await loadConfig("models");
-		else if (rawFileName === "auth.json") await loadConfig("auth");
+		if (isModelsFile) {
+			await loadConfig("models");
+			// Raw 保存也触发模型刷新，确保运行中的 Agent 实时生效
+			// pi 官方尚未支持，先注释
+			// void refreshRunningAgents();
+		} else if (rawFileName === "auth.json") await loadConfig("auth");
 		else if (rawFileName === "trust.json") await loadConfig("trust");
 		else await loadConfig("settings");
 	};
@@ -1190,11 +1306,16 @@ function ConfigModalContent(props: ConfigModalProps) {
 		}
 	};
 
-	const refreshExtensions = async () => {
+	/**
+	 * 加载扩展列表。
+	 * - forceRefresh=false：优先用主进程缓存（启动预热后通常秒开）
+	 * - forceRefresh=true：手动刷新时强制重扫，并查询 npm 更新信息
+	 */
+	const refreshExtensions = async (forceRefresh = false) => {
 		setExtensionsLoading(true);
 		setError(null);
 		try {
-			const res = await api.extensions.list();
+			const res = await api.extensions.list(forceRefresh);
 			setExtensionsData(res);
 		} catch (e) {
 			setError(e instanceof Error ? e.message : String(e));
@@ -1212,14 +1333,26 @@ function ConfigModalContent(props: ConfigModalProps) {
 			return;
 		}
 		setUninstallExtensionConfirm(null);
+		// 立刻进入卸载态以触发卡片退场动画，同时发起真实卸载；两者并行，避免“删完才闪一下”。
 		setUninstallingExtensionSource(target.source);
-		setError(null);
+		const exitAnimation = new Promise<void>((resolve) => {
+			window.setTimeout(resolve, 280);
+		});
 		try {
-			await api.extensions.uninstall(target.source, target.scope);
-			await refreshExtensions();
+			await Promise.all([
+				api.extensions.uninstall(target.source, target.scope),
+				exitAnimation,
+			]);
+			// 与禁用/手动刷新一致：强制重扫并跳过可能残留的 in-flight 缓存结果。
+			await refreshExtensions(true);
 			showToast(t("config.extensionUninstalledToast"));
 		} catch (e) {
-			setError(e instanceof Error ? e.message : String(e));
+			// 配置页顶部红字容易被滚出视口；卸载失败用 error toast，用户能立刻看到。
+			showNotice(
+				t("config.extensionUninstallFailed", { error: formatIpcError(e) }),
+				4500,
+				"error",
+			);
 		} finally {
 			setUninstallingExtensionSource(null);
 		}
@@ -1480,7 +1613,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 										<div className="config-empty">{t("common.loading")}</div>
 									) : (
 										<div className="prompts-monaco-wrap">
-											<MonacoEditor
+											<LazyMonacoEditor
 												value={editGlobalContent}
 												onChange={setEditGlobalContent}
 											/>
@@ -1542,7 +1675,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 							data={extensionsData}
 							loading={extensionsLoading}
 							uninstallingSource={uninstallingExtensionSource}
-							onRefresh={refreshExtensions}
+							onRefresh={() => void refreshExtensions(true)}
 							onUninstall={setUninstallExtensionConfirm}
 						/>
 					)}
@@ -1612,8 +1745,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 					</div>
 				)}
 
-				{toast && <div className="config-toast">{toast}</div>}
-
+				{/* toast 已改用 sonner */}
 				{deleteConfirm && (
 					<div className="config-modal-overlay" onClick={() => setDeleteConfirm(null)}>
 						<div className="config-modal-dialog" onClick={(e) => e.stopPropagation()}>

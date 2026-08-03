@@ -1,41 +1,18 @@
 import { memo } from "react";
-import { Editor, loader } from "@monaco-editor/react";
-import * as monaco from "monaco-editor";
+import { Editor } from "@monaco-editor/react";
+import { setupMonaco } from "../../utils/monacoSetup";
 
-// Monaco Editor 依赖 Web Worker 做语法高亮。Vite ?worker 后缀会把每个 worker 拆成独立 chunk，
-// 避免在 Electron 渲染进程里找不到 worker 入口而降级为无高亮的纯文本模式。
-import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
-import TsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
-import JsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
-import CssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
-import HtmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
+/** Monaco 初始化保证只执行一次 */
+let monacoInitialized = false;
+function ensureMonacoOnce(): void {
+	if (monacoInitialized) return;
+	monacoInitialized = true;
+	setupMonaco();
+}
 
-/** 只初始化一次 Monaco loader（CSP 兼容：本地 worker 不走 CDN） */
-(function ensureMonaco() {
-	self.MonacoEnvironment = {
-		getWorker(_workerId: string, label: string) {
-			switch (label) {
-				case "typescript":
-				case "javascript":
-					return new TsWorker();
-				case "json":
-					return new JsonWorker();
-				case "css":
-				case "scss":
-				case "less":
-					return new CssWorker();
-				case "html":
-				case "handlebars":
-				case "razor":
-					return new HtmlWorker();
-				default:
-					return new EditorWorker();
-			}
-		},
-	};
-
-	loader.config({ monaco });
-})();
+// 在模块作用域同步初始化，确保 <Editor> 挂载前 loader.config({ monaco }) 已生效，
+// 避免 Monaco 从 CDN 加载被 CSP 阻止。
+ensureMonacoOnce();
 
 export type MonacoEditorProps = {
 	value: string;

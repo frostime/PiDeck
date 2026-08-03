@@ -8,6 +8,7 @@ import type {
 	PiPromptTemplateListResult,
 	PiPromptTemplateSummary,
 } from "../../shared/types";
+import type { WslEnvironment } from "../wsl/WslPaths";
 
 function makeBuiltinContent(name: string, body: string): string {
 	return `---\ndescription: ${name}\n---\n\n${body}`;
@@ -169,10 +170,15 @@ when appropriate. If unsure whether a skill is needed, follow the rule:
  * frontmatter 支持 description、argument-hint 等元数据。
  */
 export class PromptManager {
-	private readonly promptsDir: string;
+	private promptsDir: string;
 
-	constructor(home = homedir()) {
-		this.promptsDir = join(home, ".pi", "agent", "prompts");
+	constructor(home?: string) {
+		this.promptsDir = join(home ?? homedir(), ".pi", "agent", "prompts");
+	}
+
+	/** 将 prompt 目录切换到统一解析出的 WSL HOME；null 恢复 Windows home。 */
+	configureWsl(environment: WslEnvironment | null) {
+		this.promptsDir = join(environment?.windowsHome ?? homedir(), ".pi", "agent", "prompts");
 	}
 
 	getDir(): string {

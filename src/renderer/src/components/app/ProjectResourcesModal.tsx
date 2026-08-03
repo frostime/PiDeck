@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { showNotice } from "../../utils/notice";
 
 import { Check, FileEdit, Pencil, ToggleLeft, ToggleRight, Trash2, X } from "lucide-react";
-import { MonacoEditor } from "../ui/MonacoEditor";
+import { LazyMonacoEditor } from "../ui/LazyMonacoEditor";
 import type {
 	PiExtensionSummary,
 	PiPromptTemplateSummary,
@@ -58,11 +59,12 @@ export function ProjectResourcesModal(props: {
 	const api = (window as unknown as { piDesktop: { projectResources: ProjectResourcesApi } }).piDesktop.projectResources;
 
 	const refresh = useMemo(
-		() => async () => {
+		() => async (showToast?: boolean) => {
 			setLoading(true);
 			setError(null);
 			try {
 				setData(await api.list(props.project.id));
+				if (showToast) showNotice(t("projectResources.refreshed"), 2000);
 			} catch (err) {
 				setError(err instanceof Error ? err.message : String(err));
 			} finally {
@@ -324,34 +326,41 @@ export function ProjectResourcesModal(props: {
 						<strong>{t("projectResources.title")}</strong>
 						<small>{props.project.path}</small>
 					</div>
-					<button type="button" onClick={props.onClose} aria-label={t("common.close")}>
-						<X size={16} />
+					<button
+						type="button"
+						onClick={props.onClose}
+						aria-label={t("common.close")}
+						title={t("common.close")}
+					>
+						<X size={18} />
 					</button>
 				</header>
 
-				<div className="project-resources-tabs">
-					<button
-						type="button"
-						className={activeTab === "skills" ? "active" : ""}
-						onClick={() => { setActiveTab("skills"); setEditingSkill(null); }}
-					>
-						{t("projectResources.skillsTab", { count: data.skills.length })}
-					</button>
-					<button
-						type="button"
-						className={activeTab === "extensions" ? "active" : ""}
-						onClick={() => setActiveTab("extensions")}
-					>
-						{t("projectResources.extensionsTab", { count: data.extensions.length })}
-					</button>
-					<button
-						type="button"
-						className={activeTab === "prompts" ? "active" : ""}
-						onClick={() => setActiveTab("prompts")}
-					>
-						{t("projectResources.promptsTab", { count: prompts.length })}
-					</button>
-					<button type="button" className="project-resources-refresh" onClick={() => void refresh()} disabled={loading}>
+				<div className="project-resources-toolbar">
+					<div className="project-resources-tabs">
+						<button
+							type="button"
+							className={activeTab === "skills" ? "active" : ""}
+							onClick={() => { setActiveTab("skills"); setEditingSkill(null); }}
+						>
+							{t("projectResources.skillsTab", { count: data.skills.length })}
+						</button>
+						<button
+							type="button"
+							className={activeTab === "extensions" ? "active" : ""}
+							onClick={() => setActiveTab("extensions")}
+						>
+							{t("projectResources.extensionsTab", { count: data.extensions.length })}
+						</button>
+						<button
+							type="button"
+							className={activeTab === "prompts" ? "active" : ""}
+							onClick={() => setActiveTab("prompts")}
+						>
+							{t("projectResources.promptsTab", { count: prompts.length })}
+						</button>
+					</div>
+					<button type="button" className="project-resources-refresh" onClick={() => void refresh(true)} disabled={loading}>
 						{loading ? t("common.loading") : t("common.refresh")}
 					</button>
 				</div>
@@ -373,7 +382,7 @@ export function ProjectResourcesModal(props: {
 								<div className="config-empty">{t("common.loading")}</div>
 							) : (
 								<div className="prompts-monaco-wrap">
-									<MonacoEditor
+									<LazyMonacoEditor
 										value={editContent}
 										onChange={setEditContent}
 									/>
@@ -384,8 +393,14 @@ export function ProjectResourcesModal(props: {
 					</div>
 				) : activeTab === "skills" ? (
 					<div className="project-resources-body">
-						<section className="project-skill-create skill-create-card">
+						<div className="project-resources-col-header">
 							<strong>{t("projectResources.createSkill")}</strong>
+						</div>
+						<div className="project-resources-list-header">
+							<strong>{t("projectResources.skillsTab", { count: data.skills.length })}</strong>
+							<span>{data.skills.length}</span>
+						</div>
+						<section className="project-skill-create">
 							<p>{t("projectResources.createSkillHint")}</p>
 							<label className="project-resources-name-field">
 								<span>{t("config.name")}</span>
@@ -399,7 +414,7 @@ export function ProjectResourcesModal(props: {
 								{createBusy ? t("config.creatingSkill") : t("config.addSkill")}
 							</button>
 						</section>
-
+						<div className="project-resources-list-section">
 						<ResourceListEmpty loading={loading} empty={data.skills.length === 0} label={t("projectResources.emptySkills")} />
 						{data.skills.map((skill) => (
 							<article key={skill.id} className="project-resource-card">
@@ -460,7 +475,7 @@ export function ProjectResourcesModal(props: {
 										title={skill.enabled ? t("common.disable") : t("common.enabled")}
 										style={skill.enabled ? { color: "var(--color-accent)" } : undefined}
 									>
-										{skill.enabled ? <ToggleRight size={14} strokeWidth={1.8} /> : <ToggleLeft size={14} strokeWidth={1.8} />}
+										{skill.enabled ? <ToggleRight size={18} strokeWidth={1.8} /> : <ToggleLeft size={18} strokeWidth={1.8} />}
 									</button>
 									<button
 										className="config-icon-btn danger"
@@ -472,11 +487,21 @@ export function ProjectResourcesModal(props: {
 								</div>
 							</article>
 						))}
+						</div>
 					</div>
 				) : activeTab === "extensions" ? (
 					<div className="project-resources-body">
-						<p className="project-resources-hint">{t("projectResources.extensionsHint")}</p>
-						<ResourceListEmpty loading={loading} empty={data.extensions.length === 0} label={t("projectResources.emptyExtensions")} />
+						<div className="project-resources-col-header">
+							<strong>{t("projectResources.extensionsTab", { count: data.extensions.length })}</strong>
+						</div>
+						<div className="project-resources-list-header">
+							<strong>{t("projectResources.extensionsTab", { count: data.extensions.length })}</strong>
+							<span>{data.extensions.length}</span>
+						</div>
+						<section className="project-skill-create">
+						</section>
+						<div className="project-resources-list-section">
+							<ResourceListEmpty loading={loading} empty={data.extensions.length === 0} label={t("projectResources.emptyExtensions")} />
 						{data.extensions.map((extension) => (
 							<article key={extension.id} className="project-resource-card">
 								<div className="project-resource-info">
@@ -496,7 +521,7 @@ export function ProjectResourcesModal(props: {
 										title={extension.enabled !== false ? t("common.disable") : t("common.enabled")}
 										style={extension.enabled !== false ? { color: "var(--color-accent)" } : undefined}
 									>
-										{extension.enabled !== false ? <ToggleRight size={14} strokeWidth={1.8} /> : <ToggleLeft size={14} strokeWidth={1.8} />}
+										{extension.enabled !== false ? <ToggleRight size={18} strokeWidth={1.8} /> : <ToggleLeft size={18} strokeWidth={1.8} />}
 									</button>
 									<button
 										className="config-icon-btn danger"
@@ -509,6 +534,7 @@ export function ProjectResourcesModal(props: {
 								</div>
 							</article>
 						))}
+						</div>
 					</div>
 				) : editingProjectPrompt ? (
 					<div className="prompts-editor-backdrop" onClick={cancelProjectPromptEditor}>
@@ -525,7 +551,7 @@ export function ProjectResourcesModal(props: {
 								<div className="config-empty">{t("common.loading")}</div>
 							) : (
 								<div className="prompts-monaco-wrap">
-									<MonacoEditor
+									<LazyMonacoEditor
 										value={editProjectPromptContent}
 										onChange={setEditProjectPromptContent}
 									/>
@@ -536,8 +562,14 @@ export function ProjectResourcesModal(props: {
 					</div>
 				) : (
 					<div className="project-resources-body">
-						<section className="project-skill-create skill-create-card">
+						<div className="project-resources-col-header">
 							<strong>{t("projectResources.createPrompt")}</strong>
+						</div>
+						<div className="project-resources-list-header">
+							<strong>{t("projectResources.promptsTab", { count: prompts.length })}</strong>
+							<span>{prompts.length}</span>
+						</div>
+						<section className="project-skill-create">
 							<label className="project-resources-name-field">
 								<span>{t("config.name")}</span>
 								<input value={newPromptName} placeholder="my-project-prompt" onChange={(event) => setNewPromptName(event.target.value)} />
@@ -550,6 +582,7 @@ export function ProjectResourcesModal(props: {
 								{creatingPrompt ? t("config.creatingSkill") : t("config.addSkill")}
 							</button>
 						</section>
+						<div className="project-resources-list-section">
 						<ResourceListEmpty loading={promptsLoading} empty={prompts.length === 0} label={t("projectResources.emptyPrompts")} />
 						{prompts.map((prompt) => (
 							<article key={prompt.path} className="project-resource-card">
@@ -583,6 +616,7 @@ export function ProjectResourcesModal(props: {
 								</div>
 							</article>
 						))}
+						</div>
 					</div>
 				)}
 			</section>

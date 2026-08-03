@@ -8,7 +8,18 @@
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Electron](https://img.shields.io/badge/Electron-38-47848f)
 ![React](https://img.shields.io/badge/React-19-61dafb)
-![Version](https://img.shields.io/badge/version-0.6.5-green)
+![Version](https://img.shields.io/badge/version-0.6.6-yellow)
+
+## Star History
+
+<!-- star-history:start -->
+<!-- star-history:end -->
+
+---
+
+**PiDeck** is an open-source pi desktop workbench for managing pi Agent sessions across local project folders, with import support for local Codex and Claude sessions so you can browse and restore them in one place. Built with Electron + TypeScript, it provides multi-project workspace management, AI session history, Git integration, built-in terminal, visual config management, and plugin extensions—so local AI coding assistants stay consistent, traceable, and configurable across projects.
+
+**Who it's for:** Developers who want to manage multiple local-project AI coding assistant sessions from a desktop app, review session history and Git status in one place, and configure pi through visual editors instead of raw JSON files.
 
 `PiDeck` is **not** a fork of pi. It is a lightweight Electron shell that orchestrates multiple `pi --mode rpc` processes, providing a native desktop UI for projects, sessions, conversations, configuration, and tool orchestration — all powered by pi's native agent capabilities.
 
@@ -16,24 +27,25 @@
 
 ## 📋 Changelog
 
-> **Latest: v0.6.5** (2026-07-13)
+> **Latest: v0.6.7** (2026-07-29)
 
-### v0.6.5 Updates
-- 🚀 **Prompt Templates System**: Full template management, built-in templates,
-  `/` picker with variable hints
-- 🚀 **Prompt/Skill Store**: Search, preview, import from prompts.chat
-  and Yao Open Prompts (121 Chinese prompts)
-- 🚀 **Git Worktree Workspace**: Branch management, session grouping by worktree
-- 🚀 **Multi-Select Messages**: Select, share, copy messages in batch
-- 🚀 **Built-in Browser Preview**: Browse in the right drawer with tabs, fullscreen, and mobile viewport presets
-- 🚀 **Session Manager**: Modal with multi-select delete, source filter
-- 🚀 **External Editor Integration**: Right-click project → "Open with" → pick editor
-- 🚀 **xhigh reasoning level** support
-- ✨ Common MonacoEditor component, unified icon buttons, unified modal sizing
-- 🐛 Windows startup crash fix (0x80000003)
-- 🐛 Pi compaction restart disconnect fix, Extension RPC lifecycle fix
-- 🐛 Interleaved thinking/tool/answer rendering, fragmented text rendering, dynamic showThinking
-- 🔧 Session open performance optimization, IPC payload reduction, cleanup
+### v0.6.7 Release Highlights
+- 🚀 **Compact titlebar + Codex-style right sidebar**
+- 🚀 **File editor nested under Files tab**
+- 🚀 **File tree drag / drop / move**
+- 🚀 **@ file suggestions with directory tree & search**
+- 🚀 **Composer file path refs via paste / drop**
+- 🚀 **Text links open in built-in editor**
+- 🚀 **Batch Ask Tab UI**
+- 🚀 **Ctrl/Cmd+click markdown links open system browser**
+- 🚀 **Tailwind CSS v4 + shadcn + sonner toasts**
+- 🚀 **Sidebar project expand/collapse persistence**
+- 🚀 **Session message Fork**
+- 🚀 **Boot splash official pi assembly animation**
+- ✨ **Plan mode flow polish**
+- ✨ **Composer widgets & extension UI**
+- ✨ **Context compact entry**
+- ✨ **UI color neutralization**
 
 [View Full Changelog →](CHANGELOG.md)
 

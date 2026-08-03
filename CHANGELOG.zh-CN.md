@@ -4,6 +4,241 @@
 
 这里记录 PiDeck 各版本的重要变化。
 
+## v0.6.7 - 2026-07-29
+
+### 🚀 新功能
+
+- **紧凑标题栏 + Codex 风格右侧栏** — 顶栏更省高度，右侧抽屉 Tab（文件 / Git /
+  浏览器 / 草稿本）改为更密的多面板工作流样式。
+- **文件编辑器收纳到 Files Tab** — 编辑器 Tab 进入文件抽屉内部，与 Git/浏览器
+  面板的 chrome 更统一。
+- **文件树拖放 / 粘贴 / 移动** — 支持拖入文件、粘贴文件，以及树内拖拽移动。
+- **@ 文件建议支持目录树与搜索** — 文件选择器可浏览目录树并过滤，深层路径更好选。
+- **Composer 粘贴 / 拖入路径引用** — 向输入框拖放或粘贴文件可插入路径 chip，
+  带空格路径也能正确保留。
+- **文本链接默认内置编辑器打开** — 点击文本文件链接走应用内编辑器，二进制仍走
+  系统外部程序。
+- **批量提问 Tab UI** — `ask_question` 批量模式以 Tab 一次展示全部问题，可选
+  Submit/审阅后再提交答案。
+- **Ctrl/Cmd+点击 Markdown 链接打开系统浏览器** — 按住修饰键点击时交给系统默认
+  浏览器，不再强制内置浏览器。
+- **Tailwind CSS v4 + shadcn + sonner Toast** — 渲染进程样式栈升级，通知迁移到
+  `sonner` 并适配主题。
+- **侧栏项目展开/折叠状态持久化** — 项目折叠状态跨重启保留。
+- **会话消息 Fork** — 用户消息操作栏支持从该消息 fork 新会话（对应 pi `/fork`）；
+  Agent 忙碌时不显示入口；成功后预填原 prompt 到输入框，可改后重发。
+- **启动页官方 pi 拼装动画** — 冷启动覆盖层循环播放与侧栏同源的像素 tetromino logo
+  动画（可调大/加速）；PiDeck 标题与副标题改用 Plantin 品牌衬线，气质对齐空状态文案。
+- **单实例复用窗口** — 默认开启：再次打开应用会唤起已有窗口（含托盘隐藏），避免多开；
+  常用设置可关闭以允许多实例（需重启生效）。
+- **启动窗口大小预设** — 外观设置可选最大化 / 全屏 / 大中紧凑窗口；默认最大化
+  （与历史 `ready-to-show` 后 maximize 一致，不挡任务栏）。
+- **会话压缩可视化配置** — 配置管理 Settings 将 `compaction` 拆为「自动压缩 / 预留回复
+  Token / 保留近期 Token」三项，不再整段 JSON 手改。
+- **LaTeX / 数学代码块渲染** — 会话内 `latex`/`tex`/`math` fence 用 KaTeX 渲染。
+- **Electron Chromium 沙箱开关** — 开发设置可启用渲染进程沙箱（默认关闭，兼容 Windows
+  安全软件/旧 GPU）；改完需重启 PiDeck。
+
+### ✨ 交互优化
+
+- **Plan 模式流程打磨** — 计划结束三卡片布局、修订返回按钮、跳过保持只读更清晰。
+- **Composer 挂件与扩展 UI** — 扩展挂件固定在输入框上方、高度更紧凑，内置扩展
+  冲突提示更友好（含 todo 文案）。
+- **上下文压缩入口** — 底栏压缩按钮仅在占用 >30% 时显示；样式与图标更克制，
+  「会话太小 / Nothing to compact」类错误改为友好提示。
+- **UI 去饱和绿色** — 降低刺眼绿色强调，优化输入栏与状态指示对比度。
+- **Worktree 侧栏层级** — 嵌套更清晰、可折叠 worktree 会话、弱化重色块与 active 行
+  噪声。
+- **扩展安装 / 卸载体验** — 进度更清楚，卸载时本地文件清理更可靠。
+- **RPC / Agent 启动选项** — 支持可选 `--no-themes` / `--offline` / `--no-extensions` /
+  `--no-skills`，启动时预热版本缓存；开发设置可禁用扩展/技能以加速或排障。
+- **文档与社区** — 官网截图更新到最新 UI；英文首页与双语导航扩展；README Star History
+  图由 CI 自动刷新；维护者教程视频制作流程补充。
+
+### 🐛 Bug 修复
+
+- **输入框历史 ↑/↓ 丢失半截草稿** — ArrowUp 改为快照 live 草稿（`livePromptByAgentRef`），
+  不再使用可能过期的 rendered prompt，ArrowDown 可完整恢复继续输入的内容。
+- **Agent 启动防闪退 / 诊断增强（尤其 macOS arm）** — 在 `spawn` 前挂上 pi 生命周期监听，
+  默认 `error` sink 避免 ENOENT 等升级成主进程未捕获异常；启动失败写入可复制诊断卡片，
+  日志补充 platform/arch 与 child-process-gone；并扩展 macOS pi 搜索路径
+  （`/opt/homebrew/bin` 等），缓解 Dock 启动 PATH 不完整。
+- **宠物状态卡死在 review/failed/jumping** (#107) — 过渡恢复定时器不再被冷却/重叠推送
+  误取消，review/failed 可按时回到 idle。
+- **停止后的流式余晖** — abort 后密封 stream generation，延迟 thinking/text 不再混入
+  下一条回复；停止反馈改为 toast 而非时间线系统卡。
+- **禁用内置扩展后仍加载** — 移除/冲突让位时真正删除用户目录下的内置扩展文件，并清理
+  残留，避免与第三方扩展工具名冲突导致 RPC 失败。
+- **手动压缩按钮与状态** — 恢复底栏 compact 入口；RPC 使用 `customInstructions`；
+  结束时正确清 `isCompacting` 并回 idle，失败原因可 toast 展示。
+- **系统标题栏缺少侧栏开关** (#104) — 使用系统原生标题栏时仍可切换左右侧栏。
+- **粘贴图片附件 + 带空格路径引用** — 图片粘贴作为附件；路径 chip 保留空格不再截断。
+- **终端 Dock 竞态 / 未处理 rejection** — 加固 pending agent 切换与关闭路径，避免
+  未捕获 Promise 异常。
+- **终端 Dock 按所有者隔离** — Dock 状态按 owner 分桶，项目终端不再跨 agent/会话串台。
+- **剪贴板 Document is not focused** — 全栈复制改走 Electron 主进程
+  `clipboard.writeText`（preload 暴露），并保留降级路径。
+- **本地文件链接可点 + todo 字体跟随** (#103) — 本地文件链接可再次点击；todo 挂件
+  遵循界面字体设置。
+- **未完成 tool/thinking 回合并入下一条回复** — 保留仅 thinking 的 assistant 回合；
+  普通未完成 run 不再错误合并到下一条回答。
+- **重发更安全** — 仅截断当前用户回合的后代节点，并拒绝不安全的非末条用户根。
+- **Select 取消不再误选第一项** — 取消返回 `value: null`，避免被当成有效选项。
+- **Agent `get_state` 超时自动重试** — 启动状态拉取超时后自动重试，避免卡在启动中。
+- **Composer 占位符与 prompt 历史** — 清空输入后恢复 placeholder；prompt 历史跨重启
+  持久化。
+- **手动发版空 tag** — workflow_dispatch 未填 tag 时发布正式 release，而非仅草稿。
+- **macOS 测试构建 OOM** — CI mac 构建改用 `build:fast` 并提高 Node 堆上限。
+- **package-lock 依赖同步** — 修复合并/工具链漂移后缺失的 lock 条目。
+
+### 🙏 致谢
+
+感谢本版本所有贡献者提交的 PR、Issue 和反馈：
+
+- **@1900EasonJin** — 系统标题栏模式下补充左右侧栏开关 (#104)；宠物状态卡死修复 (#107)
+- **@zzq168281-coder** — 本地文件链接可交互 & todo 字体跟随 (#103)
+- **@me9rez** — TypeScript 增量编译产物整理 (#97)
+- **@weishiair** — 禁用内置扩展时删除用户目录残留文件，修复工具冲突导致 RPC 失败
+- **@clancyclaw** — RichInput 多行换行保留
+
+特别感谢 **微时佬友** 提供的 Grok 模型服务，用于我们的社区测试环境 🎉
+
+> 💬 **QQ 反馈交流群：1026218644**
+
+感谢所有给 PiDeck 提建议和反馈 Bug 的用户 🙏
+
+---
+
+## v0.6.6 - 2026-07-25
+
+### 🚀 新功能
+
+- **侧栏品牌区重新设计** — Pi 官方 canvas logo 裁掉棋盘空边，右侧 PiDeck 字标使用 Plantin 衬线字体，
+  agent 启动/关闭时播放拼装动画，定格色适配主题墨黑/白。
+- **多 Tab 文件编辑器** — 最多 5 个并发编辑器 Tab，弹框/侧栏双模式，Diff 差异对比，Monaco 编辑器
+  支持暗色/亮色主题、Markdown 预览、自动保存（Ctrl+S）和脏状态标记。
+- **& 会话引用快捷输入** — 键入 & 弹出同项目会话搜索列表，可选择特定消息或引用全部上下文，
+  选择持久化，重新打开恢复上次勾选。
+- **飞书/Lark 集成** — 双向对话、流式卡片、自动拉群、成员管理，Composer 飞书状态入口。
+- **Git 源代码管理（大重构）** — VS Code 风格 3 Tab 面板（变更/历史/比较）、AI 提交摘要生成、
+  Git 图形化提交历史（彩色泳道）、Cherry-pick/Revert/Reset/Drop、分支切换、Worktree 支持。
+- **Git Push / Pull** — 变更面板标题栏新增 Push 和 Pull 按钮，完整 IPC 链路及错误通知。
+- **Prompt 中文提示词精选** — 取代旧 yao-prompts 文件，SQLite 存储 ~4000 条中文提示词，
+  支持 20+ 分类筛选、FTS3 全文搜索、分页浏览、一键导入。
+- **Skills.sh 社区技能商店** — 切换到 CLI 注册中心，支持安装量排序和安装中动画。
+- **HTML 预览改为内置浏览器** — 文件编辑器打开 HTML 默认显示源码，点击预览按钮切换到右侧
+  浏览器面板用 webview 渲染，不再受 iframe sandbox 限制。
+- **Composer 重新设计（OpenCode 风格）** — 顶部圆框按钮组移至底部操作栏：模式切换/Prompt/
+  附件/模型名/思考级别，均可点击。
+- **客户端消息队列** — Agent 忙碌时可排队发送（follow-up 或 steer 模式），可撤回已排队
+  消息回输入框编辑，可视化排队状态。
+- **推荐扩展包改进** — 全部显示复制安装命令按钮，操作按钮横向排列，安装状态按实际变动。
+- **技能安装异步执行** — `npx skills install` 改为 `execFile` 异步调用，不再阻塞主进程 UI。
+- **内置浏览器面板** — 右侧抽屉浏览，支持标签页、全屏、移动端预设，链接直接在浏览器面板中打开。
+- **草稿本（ScratchPad）** — 浮层式草稿本，支持内容预览、勾选映射，使用主题语义颜色。
+- **本地快速打包** — `npm run compile-exe` 输出便携 exe，`npm run dist:win` 支持单格式构建。
+- **历史会话自动滚动** — 打开历史会话时自动滚动到最新消息。
+- **Toast 通知系统** — 自建通知机制替代 `sonner` 依赖，Agent 操作、文件复制、模型切换、Git 操作均有通知。
+- **可展开的压缩卡片** — 压缩前消息历史在可折叠区域中查看。
+- **WSL 环境支持（实验性）** — 会话扫描、文件操作、路径处理适配 WSL。
+- **WSL 环境支持** — 会话扫描、文件操作、路径处理适配 WSL（感谢 @Lopution PR #84）。
+
+### 🔧 终端与交互
+
+- **终端 Shell 选择器** — Windows 自动检测可用 shell（pwsh、Windows PowerShell、
+  cmd、Git Bash、WSL），+ 按钮旁下拉菜单选择指定 shell 打开终端。
+- **项目级终端** — 终端不再绑定 agent，改为绑定项目。切换 agent 或无 agent 运行时
+  终端保持打开。
+
+### ✨ 交互优化
+
+- **设置页重构** — 全局草稿保存/取消，新 Tab 分类：通用、外观、代理、开发、宠物、存储。
+- **字号分区独立配置** — 聊天、代码、侧栏、输入框独立字号，预设字体主题和窗口缩放。
+- **文件侧栏增强** — 新建文件/文件夹功能，Git 面板目录树展示，相对路径，抽屉状态按项目持久化。
+- **行为选择器移到停止按钮左侧** — 视觉更清晰。
+- **Composer 底部栏样式统一** — 所有按钮使用 `composer-bar-btn` 风格（28px 小圆角）。
+- **Skills/Prompts 切回本地 Tab 自动刷新** — 安装后立即可见。
+- **文件预览** — Markdown 默认渲染预览（可切换源码），HTML 在浏览器面板中预览。
+- **Diff 分栏/合并切换** — Modal 模式下可靠工作（key 重建 + keepCurrentModel），
+  侧栏模式隐藏按钮（容器太窄无法分栏）。
+- **浏览器面板关闭/最大化按钮移至标签栏** — 节省顶部空间。
+- **安装按钮旁加复制命令按钮** — 方便手动终端安装。
+- **会话大纲 & 快捷操作栏** — 浮动大纲面板，支持跳转到指定消息；快捷操作包括终端、文件抽屉、
+  Git、浏览器、草稿本、外部编辑器。
+- **匿名会话 Chat 入口** — 项目列表顶部固定 Chat 入口，写入应用用户目录，适合无需绑定代码项目的通用对话。
+- **内容宽度限制** — 可拖拽的内容宽度滑块，默认不限宽，往左拖逐渐变窄。
+- **Pin 模式** — 将常用 Agent 固定在侧栏顶部。
+
+### 🐛 Bug 修复
+
+- **Monaco CSP 报错** — `loader.config({ monaco })` 移至模块作用域同步初始化。
+- **TurnRow "Rendered fewer hooks" 崩溃** — 修复发送消息后白屏。
+- **"TextModel got disposed before DiffEditorWidget model got reset"** — 添加
+  `keepCurrentOriginalModel` + `keepCurrentModifiedModel` 防止模型销毁竞态。
+- **停止按钮在 agent 回答时不可见** — Agent 繁忙时始终显示。
+- **匿名 agent 侧栏重复** — 增加 `noSession` 匹配路径。
+- **Agent 启动状态卡在 "starting"** — 修复 `setAgents` 覆盖逻辑。
+- **同会话重发截断错误** — 修复为只删除最后一条消息的后代条目，而非全部删除之前的内容。
+- **Skills.sh 搜索崩溃** — `loadPersisted()` 增加 `Array.isArray` 防御。
+- **Prompt 分类无数据** — 修复 slug 和原始名匹配问题。
+- **标题栏色差** — 统一 `.window-controls` 背景色。
+- **sql.js 打包后加载失败** — 修复 WASM 路径解析。
+- **GitService.getStagedDiff maxBuffer 过小** — 从 5KB 提升到 10MB。
+- **dev 终端中文乱码** — Windows 下自动 `chcp 65001`。
+- **HTML 预览白屏** — 修复 webview 无限刷新和初始加载 ERR_ABORTED。
+- **Docs 站构建失败** — VitePress YAML `&` 改为引号包裹。
+- **TypeScript CI 构建失败** — 移除重复的 `setAttachedImages` 函数。
+- **内置扩展禁用后无法恢复** — 修复禁用后丢失的问题。
+- **旧版 pi 兼容** — 优雅降级处理 `--no-approve` 参数。
+- **发送消息自动滚动** — 滚动到末尾而非开头。
+- **移除思考动画** — 统一使用"正在回应"动画作为默认等待提示。
+- **Agent idle 后 stuck 动画** — 添加 fallback idle 检查。
+- **多选分享图片内边距** — 添加 padding 避免文字贴边。
+- **Ask 弹框交互** — 确认按钮尺寸统一、自定义输入始终可见、弹框打开时隐藏背景卡片、
+  过滤 Pi 自带的 ✎ 选项。
+- **消息 CPA_DONE 标记清理** — 从消息末尾移除 `CPA_DONE`。
+- **用户消息编辑** — 编辑后回填到输入框重新发送。
+- **飞书链接打包后 "Cannot find package @larksuiteoapi/node-sdk"** —
+  `afterPack` 脚本删除了 CJS 构建产物 `lib/`，但该包没有 `exports` 字段，
+  Node.js 的 `await import()` 仍通过 `main` 字段（`./lib/index.js`）解析，
+  删除后导致运行时找不到模块。已移除该删除逻辑以修复打包后的飞书功能。
+
+### 🐛 终端问题修复
+
+- **终端始终打开 pwsh.exe** — `spawnShell` 计算了按首选 shell 排序的列表，
+  但循环仍遍历原始未排序数组，导致首选 shell 被忽略。
+- **Shell 下拉菜单被 overflow:hidden 裁剪** — `.terminal-tabs` 的
+  `overflow: hidden` 裁剪了绝对定位的 Shell 选择菜单。
+- **窗口关闭后终端数据导致崩溃** — emit 回调未检查 `webContents` 是否已销毁。
+- **停止按钮首次点击不生效** — 新增 `recentlyAborted` 集合，拦截 abort 后 pi
+  的延迟事件。
+- **429 错误未在聊天区显示** — 自动重试失败后将 agent 状态设为 error 并追加
+  可见错误信息到聊天区域。
+
+### 🙏 致谢
+
+感谢所有贡献者提交的 PR、Issue 和反馈：
+
+- **@1900EasonJin** — 飞书集成、记忆管理卡片、Thinking 节流、侧栏卡片化设计、
+  草稿本、终端编码修复 (#80, #74, #60, #44, #42, #35, #34)
+- **@frostime** — 会话信息同步、自定义字体/缩放、模型选择器自动滚动、
+  最大推理等级、RPC 扩展生命周期 (#58, #56, #53, #52, #50)
+- **@me9rez** — 依赖清理、SkillManager 软连接扫描 (#86, #69)
+- **@bfzha** — VS Code 风格 Git 面板及复杂工作流 (#68)
+- **@Lopution** — 跨桌面 WSL 路径处理 (#84)
+- **@buaassp** — 隐藏内部 pi-subagent 子会话 (#57)
+- **@magic2066** — Codex 子代理导入修复、Linux 开发/宠物修复 (#40, #41)
+- **@pangolinknight** — 流式消息节流、工具结果截断、白屏修复 (#33)
+
+特别感谢 **微时佬友** 提供的 Grok 模型服务，用于我们的社区测试环境 🎉
+
+> 💬 **QQ 反馈交流群：1026218644**
+
+感谢所有给 PiDeck 提建议和反馈 Bug 的用户 🙏
+
+---
+
+
 ## v0.6.5 - 2026-07-13
 
 ### 🚀 新功能

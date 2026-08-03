@@ -68,6 +68,28 @@ export function SettingsTab(props: {
 		baseDelayMs: (data as any).retry?.baseDelayMs ?? 5000,
 	};
 
+	/**
+	 * pi 会话压缩配置（~/.pi/agent/settings.json 的 compaction）。
+	 * 与 pi 文档默认值对齐：自动压缩开启、预留 16k 回复空间、保留最近 20k tokens。
+	 * 只规范化这 3 个字段，避免把未知扩展字段写丢。
+	 */
+	const rawCompaction =
+		data.compaction && typeof data.compaction === "object" && !Array.isArray(data.compaction)
+			? (data.compaction as Record<string, unknown>)
+			: {};
+	const compactionConfig = {
+		enabled: typeof rawCompaction.enabled === "boolean" ? rawCompaction.enabled : true,
+		reserveTokens:
+			typeof rawCompaction.reserveTokens === "number" && Number.isFinite(rawCompaction.reserveTokens)
+				? Math.max(0, Math.floor(rawCompaction.reserveTokens))
+				: 16384,
+		keepRecentTokens:
+			typeof rawCompaction.keepRecentTokens === "number" &&
+			Number.isFinite(rawCompaction.keepRecentTokens)
+				? Math.max(0, Math.floor(rawCompaction.keepRecentTokens))
+				: 20000,
+	};
+
 	// 首次进入设置页时清理旧版 UI 写入的 provider/enable 等字段，保证后续保存只留下安全的两个参数。
 	const retryInitializedRef = useRef(false);
 	useEffect(() => {
@@ -79,6 +101,30 @@ export function SettingsTab(props: {
 		retryInitializedRef.current = true;
 	}, []);
 
+	// 首次进入时把 compaction 规范化成可编辑结构；保留用户已有的额外字段。
+	const compactionInitializedRef = useRef(false);
+	useEffect(() => {
+		if (compactionInitializedRef.current) return;
+		const existing = data.compaction;
+		const next = {
+			...(existing && typeof existing === "object" && !Array.isArray(existing)
+				? (existing as Record<string, unknown>)
+				: {}),
+			...compactionConfig,
+		};
+		const needsNormalize =
+			!existing ||
+			typeof existing !== "object" ||
+			Array.isArray(existing) ||
+			typeof (existing as any).enabled !== "boolean" ||
+			typeof (existing as any).reserveTokens !== "number" ||
+			typeof (existing as any).keepRecentTokens !== "number";
+		if (needsNormalize) {
+			props.onChange({ ...data, compaction: next });
+		}
+		compactionInitializedRef.current = true;
+	}, []);
+
 	const updateRetry = (patch: Record<string, unknown>) => {
 		props.onChange({
 			...data,
@@ -86,7 +132,25 @@ export function SettingsTab(props: {
 		});
 	};
 
-	/** 配置键名 → 显示标签（未映射的键名回退显示原始 key） */
+	const updateCompaction = (patch: Partial<typeof compactionConfig>) => {
+		const existingExtra =
+			data.compaction && typeof data.compaction === "object" && !Array.isArray(data.compaction)
+				? (data.compaction as Record<string, unknown>)
+				: {};
+		props.onChange({
+			...data,
+			compaction: {
+				...existingExtra,
+				...compactionConfig,
+				...patch,
+			},
+		});
+	};
+
+	/**
+	 * 配置键名 → 显示标签。
+	 * 已登记 i18n 的键走多语言；未登记回退原始 key，避免未知字段空白。
+	 */
 	const configLabel = (key: string): string => {
 		switch (key) {
 			case "enabledModels": return t("config.label.enabledModels");
@@ -114,8 +178,34 @@ export function SettingsTab(props: {
 			case "defaultThinkingLevel": return t("config.label.defaultThinkingLevel");
 			case "quietStartup": return t("config.label.quietStartup");
 			case "collapseChangelog": return t("config.label.collapseChangelog");
+			case "compaction": return t("config.label.compaction");
+			case "sessionDir": return t("config.label.sessionDir");
+			case "steeringMode": return t("config.label.steeringMode");
+			case "followUpMode": return t("config.label.followUpMode");
+			case "transport": return t("config.label.transport");
+			case "httpProxy": return t("config.label.httpProxy");
+			case "shellPath": return t("config.label.shellPath");
+			case "shellCommandPrefix": return t("config.label.shellCommandPrefix");
+			case "npmCommand": return t("config.label.npmCommand");
+			case "thinkingBudgets": return t("config.label.thinkingBudgets");
+			case "branchSummary": return t("config.label.branchSummary");
+			case "doubleEscapeAction": return t("config.label.doubleEscapeAction");
+			case "treeFilterMode": return t("config.label.treeFilterMode");
 			default: return key;
 		}
+	};
+
+	/** 全局会话目录：空值表示使用 pi 默认 ~/.pi/agent/sessions/<encoded-cwd>/ */
+	const sessionDirValue = typeof data.sessionDir === "string" ? data.sessionDir : "";
+	const updateSessionDir = (raw: string) => {
+		const next = raw.trim();
+		if (!next) {
+			// 清空时移除字段，避免写入空字符串覆盖默认行为
+			const { sessionDir: _removed, ...rest } = data;
+			props.onChange(rest);
+			return;
+		}
+		props.onChange({ ...data, sessionDir: raw });
 	};
 
 	return (
@@ -145,6 +235,24 @@ export function SettingsTab(props: {
 					/>
 				</div>
 
+				{/* ── 全局会话目录（仅编辑 ~/.pi/agent/settings.json 的 sessionDir） ── */}
+				<div className="config-retry-group">
+					<div className="config-settings-row config-retry-header-row">
+						<span className="config-settings-section-title">{t("config.sessionDir.title")}</span>
+						<span className="config-settings-section-hint">{t("config.sessionDir.hint")}</span>
+					</div>
+					<div className="config-settings-row">
+						<span className="config-settings-key">{t("config.label.sessionDir")}</span>
+						<input
+							className="config-settings-input"
+							type="text"
+							value={sessionDirValue}
+							placeholder={t("config.sessionDir.placeholder")}
+							onChange={(e) => updateSessionDir(e.target.value)}
+						/>
+					</div>
+				</div>
+
 				{/* ── 重试配置 ── */}
 				<div className="config-retry-group">
 					<div className="config-settings-row config-retry-header-row">
@@ -161,8 +269,75 @@ export function SettingsTab(props: {
 				</div>
 				</div>
 
+				{/* ── 会话压缩：拆成开关 + 两个 token 数，避免用户直接改 JSON 对象 ── */}
+				<div className="config-retry-group">
+					<div className="config-settings-row config-retry-header-row">
+						<span className="config-settings-section-title">{t("config.compaction.title")}</span>
+						<span className="config-settings-section-hint">{t("config.compaction.hint")}</span>
+					</div>
+					<div className="config-settings-row">
+						<span className="config-settings-key">{t("config.compaction.enabled")}</span>
+						<label className="config-checkbox-label">
+							<input
+								type="checkbox"
+								checked={compactionConfig.enabled}
+								onChange={(e) => updateCompaction({ enabled: e.target.checked })}
+							/>
+							<span>
+								{compactionConfig.enabled
+									? t("config.compaction.enabledOn")
+									: t("config.compaction.enabledOff")}
+							</span>
+						</label>
+					</div>
+					<div className="config-settings-row">
+						<span className="config-settings-key" title={t("config.compaction.reserveTokensHint")}>
+							{t("config.compaction.reserveTokens")}
+						</span>
+						<input
+							className="config-settings-input"
+							type="number"
+							min={0}
+							step={1024}
+							value={compactionConfig.reserveTokens}
+							onChange={(e) =>
+								updateCompaction({
+									reserveTokens: Math.max(0, Math.floor(Number(e.target.value) || 0)),
+								})
+							}
+						/>
+					</div>
+					<div className="config-settings-row">
+						<span className="config-settings-key" title={t("config.compaction.keepRecentTokensHint")}>
+							{t("config.compaction.keepRecentTokens")}
+						</span>
+						<input
+							className="config-settings-input"
+							type="number"
+							min={0}
+							step={1024}
+							value={compactionConfig.keepRecentTokens}
+							onChange={(e) =>
+								updateCompaction({
+									keepRecentTokens: Math.max(0, Math.floor(Number(e.target.value) || 0)),
+								})
+							}
+						/>
+					</div>
+					<div className="config-settings-row config-retry-header-row">
+						<span className="config-settings-section-hint">{t("config.compaction.manualHint")}</span>
+					</div>
+				</div>
+
 				{entries
-					.filter(([key]) => key !== "enabledModels" && key !== "retry")
+					// sessionDir / retry / compaction / enabledModels 已有专用区块，避免列表里重复一行
+					.filter(
+						([key]) =>
+							key !== "enabledModels" &&
+							key !== "retry" &&
+							key !== "sessionDir" &&
+							key !== "compaction",
+					)
 					.map(([key, value]) => (
 					<div key={key} className="config-settings-row">
 						<span className="config-settings-key">{configLabel(key)}</span>

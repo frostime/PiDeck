@@ -1,3 +1,4 @@
+import { showNotice } from "../utils/notice";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, FileEdit, Pencil, ShoppingBag, Trash2, X } from "lucide-react";
 import type {
@@ -7,7 +8,7 @@ import type {
 } from "../../../shared/types";
 import { t } from "../i18n";
 import { CloseIconButton } from "../components/ui/IconButton";
-import { MonacoEditor } from "../components/ui/MonacoEditor";
+import { LazyMonacoEditor } from "../components/ui/LazyMonacoEditor";
 import { PromptStoreTab } from "./PromptStoreTab";
 
 export function PromptsTab(props: {
@@ -50,25 +51,22 @@ export function PromptsTab(props: {
 
 	// 编辑器提示状态
 	const [showHint, setShowHint] = useState(false);
-	const [savedHint, setSavedHint] = useState(false);
 	const prevSaving = useRef(props.editSaving);
 
 	// 当编辑器打开时，显示快捷键提示
 	useEffect(() => {
 		if (props.editingTemplate) {
 			setShowHint(true);
-			setSavedHint(false);
+			/* savedHint 已改用 toast (sonner) */
 			const timer = setTimeout(() => setShowHint(false), 3000);
 			return () => clearTimeout(timer);
 		}
 	}, [props.editingTemplate]);
 
-	// 保存完成后显示临时 "已保存" 提示
+	// 保存完成后显示 toast 提示（改用 sonner）
 	useEffect(() => {
 		if (prevSaving.current && !props.editSaving) {
-			setSavedHint(true);
-			const timer = setTimeout(() => setSavedHint(false), 2000);
-			return () => clearTimeout(timer);
+			showNotice(t("config.promptSavedHint"), 2000);
 		}
 		prevSaving.current = props.editSaving;
 	});
@@ -96,7 +94,7 @@ export function PromptsTab(props: {
 			<div className="prompts-tab-bar">
 				<button
 					className={`prompts-tab-btn ${promptTab === "local" ? "active" : ""}`}
-					onClick={() => setPromptTab("local")}
+					onClick={() => { setPromptTab("local"); props.onRefresh(); }}
 				>
 					{t("config.nav.prompts")}
 				</button>
@@ -256,7 +254,6 @@ export function PromptsTab(props: {
 							<span className="file-diff-header-file">
 								{props.editingTemplate.name}.md
 								{showHint && <span className="file-diff-hint">{t("config.promptSaveHint")}</span>}
-								{savedHint && <span className="file-diff-hint saved">{t("config.promptSavedHint")}</span>}
 							</span>
 							<div className="file-diff-header-actions">
 								<CloseIconButton
@@ -269,7 +266,7 @@ export function PromptsTab(props: {
 							<div className="config-empty">{t("common.loading")}</div>
 						) : (
 							<div className="prompts-monaco-wrap">
-								<MonacoEditor
+								<LazyMonacoEditor
 									value={props.editContent}
 									onChange={props.onChangeEditContent}
 								/>

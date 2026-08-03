@@ -125,12 +125,17 @@ let previewSettings: AppSettings = {
 	theme: "system",
 	lightBackground: "white",
 	language: "system",
+	startupWindowMode: "maximized",
 	piEnvironmentChecked: true,
+	enableGitManagement: true,
+	gitCommitMessagePrompt: "",
 	closeToTray: true,
+	singleInstance: true,
 	enableNotifications: true,
 	// showThinking 由 pi agent 的 hideThinkingBlock 控制，运行时从主进程加载
 	showThinking: true,
 	showDevTools: false,
+	electronChromiumSandbox: false,
 	piProxyEnabled: false,
 	piProxyUrl: "http://127.0.0.1:7890",
 	piProxyBypass: "localhost,127.0.0.1,::1",
@@ -138,6 +143,9 @@ let previewSettings: AppSettings = {
 	desktopProxyUrl: "http://127.0.0.1:7890",
 	desktopProxyBypass: "localhost,127.0.0.1,::1",
 	customPiPath: "",
+	wslEnabled: false,
+	wslDistro: "Ubuntu",
+	wslUser: "root",
 	telemetryEnabled: true,
 	webServiceEnabled: false,
 	webServiceHost: "0.0.0.0",
@@ -166,15 +174,22 @@ let previewSettings: AppSettings = {
 	fontFamilyBaseCustom: "",
 	fontFamilyMono: "commit-mono",
 	fontFamilyMonoCustom: "",
+	removedBuiltInExtensions: [],
+	disableUpdateCheck: false,
+	piRpcOffline: true,
+	piRpcNoExtensions: false,
+	piRpcNoSkills: false,
 };
 
 export function createPreviewApi(): PiDesktopApi {
 	const noop = (() => () => undefined) as any;
-	const createTerminalTab = async (agentId: string) => {
+	const createTerminalTab = async (agentId: string, shell?: string, cwd?: string) => {
+		const shellName = shell ?? "powershell";
+		const displayName = shellName === "git-bash" ? "Git Bash" : shellName === "bash" ? "bash" : shellName === "cmd" ? "cmd" : "PowerShell";
 		const tab: TerminalTab = {
 			id: `preview-terminal-${terminalTabs.length + 1}`,
 			agentId,
-			title: `PowerShell ${terminalTabs.length + 1}`,
+			title: `${displayName} ${terminalTabs.length + 1}`,
 			cwd: "C:/Users/14012/preview-project",
 			shell: "powershell",
 			createdAt: Date.now(),
@@ -223,6 +238,9 @@ export function createPreviewApi(): PiDesktopApi {
 			listRoot: async () => projects,
 			listWorktreeChildren: async () => [],
 			toggleWorktreeEnabled: async () => projects[0],
+			chooseChatPath: async () => null,
+			setChatPath: async () => projects[0],
+			listModels: async () => [],
 		},
 		projectResources: {
 			list: async () => ({ skills: [], extensions: [] }),
@@ -274,9 +292,15 @@ export function createPreviewApi(): PiDesktopApi {
 			open: async () => undefined,
 			showInFolder: async () => undefined,
 			readContent: async () => "",
+			readBase64: async () => "",
 			writeContent: async () => undefined,
 			delete: async () => undefined,
+			copy: async () => [],
+			move: async () => [],
 			rename: async () => "",
+			create: async () => "",
+			getPathForFile: () => "",
+			getClipboardPaths: () => [],
 		},
 		sessions: {
 			list: async () => getSessions(),
@@ -287,6 +311,13 @@ export function createPreviewApi(): PiDesktopApi {
 			}),
 			exportHtml: async () => ({ path: "preview-session.html" }),
 			delete: async () => undefined,
+			// 预览模式下返回固定 mock 数据，真实环境由主进程从 JSONL 文件读取
+			readMessages: async () => [
+				{ role: "user", content: "Preview user message", timestamp: Date.now() - 60000 },
+				{ role: "assistant", content: "Preview assistant response", timestamp: Date.now() - 30000 },
+			],
+			readSessionMeta: async () => ({}),
+			readChatMessages: async () => [],
 		},
 		codexSessions: {
 			scan: async () => [],
@@ -312,13 +343,33 @@ export function createPreviewApi(): PiDesktopApi {
 			}),
 			// 预览环境无真实 Git，返回空原始内容，差异左侧显示为空。
 			originalContent: async () => "",
-			changedFiles: async () => [],
 			worktreeList: async () => [],
 			worktreeCreate: async (_projectId, branchName) => ({
 				path: `/tmp/worktree/${branchName}`,
 				branch: branchName,
 			}),
 			worktreeRemove: async () => true,
+				commitLog: async () => [],
+				refs: async () => [],
+				branchCompare: async () => ({ files: [], ahead: 0, behind: 0 }),
+				commitDetail: async () => null,
+				commitFileDiff: async () => null,
+				diffFileBetween: async () => "",
+				status: async () => ({ merge: [], index: [], workingTree: [], untracked: [] }),
+				workspaceFileDiff: async () => null,
+				stage: async () => {},
+				unstage: async () => {},
+				discard: async () => {},
+				commit: async () => {},
+				cherryPick: async () => {},
+				revert: async () => {},
+				reset: async () => {},
+				dropCommit: async () => {},
+				generateCommitMessage: async () => "",
+				init: async () => {},
+				push: async () => {},
+				pull: async () => {},
+				fetch: async () => {},
 		},
 		logs: {
 			list: async () => [],
@@ -368,11 +419,23 @@ export function createPreviewApi(): PiDesktopApi {
 				version: "preview",
 			}),
 		},
+		wsl: {
+			listDistros: async () => ["Ubuntu", "Debian"],
+			validateConnection: async (_distro, _user) => ({
+				ok: true,
+				whoami: "preview",
+				piVersion: "preview",
+				error: "",
+			}),
+		},
 		app: {
 			info: async () => ({
 				version: "preview",
 				releasesUrl: "https://github.com/ayuayue/pi-desktop/releases",
+				platform: "win32" as NodeJS.Platform,
+				homeDir: "C:/Users/preview",
 			}),
+			preferredSystemLanguages: async () => navigator.languages?.length ? [...navigator.languages] : [navigator.language],
 			checkUpdate: async () => ({
 				currentVersion: "preview",
 				latestVersion: "preview",
@@ -388,6 +451,7 @@ export function createPreviewApi(): PiDesktopApi {
 			}),
 			installUpdate: async () => undefined,
 			onUpdateProgress: () => () => undefined,
+			onOpenInBrowser: () => () => undefined,
 			feedbackEnvironment: async () => ({
 				appVersion: "preview",
 				platform: "win32",
@@ -471,7 +535,7 @@ export function createPreviewApi(): PiDesktopApi {
 			}),
 		},
 		extensions: {
-			list: async () => ({
+			list: async (_forceRefresh = false) => ({
 				extensions: [
 					{
 						id: "user:npm:preview-extension",
@@ -484,7 +548,8 @@ export function createPreviewApi(): PiDesktopApi {
 			}),
 			uninstall: async () => undefined,
 			install: async (_source: string) => "",
-			toggle: async () => undefined,
+			removeBuiltIn: async () => undefined,
+			restoreBuiltIn: async () => undefined,
 			update: async () => ({
 				command: "pi update --extensions --no-approve",
 				output: "Preview mode: extensions update output",
@@ -567,6 +632,11 @@ export function createPreviewApi(): PiDesktopApi {
 				type: "directory",
 			}),
 		},
+		skillHub: {
+			search: async () => ({ query: "", total: 0, items: [] }),
+			detail: async () => null,
+			install: async (slug) => ({ success: true, slug, installDir: "", message: "Preview install" }),
+		},
 		settings: {
 			get: async (): Promise<AppSettings> => ({ ...previewSettings }),
 			update: async (patch): Promise<AppSettings> => {
@@ -629,7 +699,7 @@ export function createPreviewApi(): PiDesktopApi {
 				return agent;
 			},
 			stop: async () => undefined,
-			prompt: async () => undefined,
+			prompt: async () => ({ accepted: true }),
 			abort: async () => undefined,
 			exportHtml: async () => ({ path: "preview.html" }),
 			getForkMessages: async () => [
@@ -678,6 +748,10 @@ export function createPreviewApi(): PiDesktopApi {
 				modelName: "Preview GPT",
 				thinkingLevel: "low",
 			}),
+			refreshModels: async () => ({
+				modelName: "Preview GPT",
+				thinkingLevel: "low",
+			}),
 			cycleThinking: async () => ({
 				modelName: "Preview GPT",
 				thinkingLevel: "medium",
@@ -691,6 +765,7 @@ export function createPreviewApi(): PiDesktopApi {
 			],
 			editMessage: async () => undefined,
 			deleteMessage: async () => undefined,
+			prepareResend: async () => ({ text: "Preview prompt" }),
 			onState: noop,
 			onFocusTarget: noop,
 			onMessages: ((
@@ -704,6 +779,7 @@ export function createPreviewApi(): PiDesktopApi {
 			}) as any,
 			onLog: noop,
 			onThinking: noop,
+			onNotice: noop,
 			onRpcLog: noop,
 			onRuntimeState: noop,
 			onUiRequest: noop,
@@ -736,10 +812,10 @@ export function createPreviewApi(): PiDesktopApi {
 		terminal: {
 			list: async (agentId) =>
 				terminalTabs.filter((tab) => tab.agentId === agentId),
-			ensure: async (agentId) => {
+			ensure: async (agentId, cwd) => {
 				const existing = terminalTabs.filter((tab) => tab.agentId === agentId);
 				if (existing.length > 0) return existing;
-				return [await createTerminalTab(agentId)];
+				return [await createTerminalTab(agentId, undefined, cwd)];
 			},
 			create: createTerminalTab,
 			input: async (tabId, data) => {
@@ -764,6 +840,11 @@ export function createPreviewApi(): PiDesktopApi {
 					terminalExitListeners.delete(callback);
 				};
 			},
+			shells: async () => [
+				{ shell: "powershell", label: "PowerShell", available: true },
+				{ shell: "pwsh", label: "pwsh", available: true },
+				{ shell: "cmd", label: "cmd", available: true },
+			],
 		},
 		feishu: {
 			connect: async () => ({ success: true, message: "预览模式" }),
@@ -786,7 +867,10 @@ export function createPreviewApi(): PiDesktopApi {
 			onBotsChanged: () => () => {},
 			onWhoamiResult: () => () => {},
 			sessionBotGet: async () => null,
-			sessionBotSet: async () => {},
+			sessionBotSet: async () => ({ success: true }),
+		},
+		dialog: {
+			pickFiles: async () => [],
 		},
 		browser: {
 			openExternal: async () => {},
@@ -798,6 +882,10 @@ export function createPreviewApi(): PiDesktopApi {
 			load: async () => ({ content: "", lastEditedAt: 0, cursorPosition: 0 }),
 			save: async () => {},
 			export: async () => false,
+		},
+
+		clipboard: {
+			writeText: async (_text: string) => {},
 		},
 	};
 }
